@@ -1,10 +1,12 @@
 {
-    "server_id": "58d72957-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "server_id": "在这里填服务器UUID（多台用英文逗号分隔：uuid1,uuid2）",
+    "token": "在这里填Cookie中的token（JWT，同一账号所有服务器共用）",
     "ads_per_extension": 3,
     "ad_duration_sec": 32,
+    "extensions_per_run": 4,
     "headless": false,
     "use_system_chrome": false,
     "telegram_bot_token": "",
-    "telegram_chat_id": ""
+    "telegram_chat_id": "",
+    "tg_title": "Godlike 续期通知"
 }
