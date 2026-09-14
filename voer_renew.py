@@ -65,6 +65,11 @@ STOPPED_STATUSES = {
     "halted",
     "inactive",
     "down",
+    "provisioning_error",
+    "provisioning error",
+    "error",
+    "failed",
+    "fail",
 }
 
 # 运行中
@@ -477,9 +482,9 @@ def is_stopped(status: str) -> bool:
     st = normalize_status(status)
     if st in STOPPED_STATUSES:
         return True
-    # 模糊匹配
-    for k in ("stop", "off", "halt", "exit", "down", "shut"):
-        if k in st:
+    # 模糊匹配（含平台 provisioning error）
+    for k in ("stop", "off", "halt", "exit", "down", "shut", "error", "fail", "provision"):
+        if k in st and "running" not in st:
             return True
     return False
 
@@ -901,31 +906,71 @@ def try_power_on(page, cfg) -> tuple[bool, dict | None]:
         return False, state
 
     log(f"已点击开机: {hit}")
-    page.wait_for_timeout(4000)
+    page.wait_for_timeout(5000)
 
-    # 开机几乎总会要求看 3 个广告（截图已确认 UI）
-    log("开始处理开机广告（Watch 3 ads to start）…")
-    watched = watch_reward_ads(page, cfg, reason="开机广告")
-    if watched < 1:
-        log("开机广告一个都没点到，尝试再点一次 Start 后重试")
-        click_anywhere(page, labels, 10000, exact=False, force=True)
-        page.wait_for_timeout(3000)
-        watched = watch_reward_ads(page, cfg, reason="开机广告-重试")
+    # 平台有时提示「下次重试不需要观看广告」（如 backup 超时后的 PROVISIONING ERROR）
+    no_ad_hint = wait_for_any_text(
+        page,
+        [
+            "不需要观看广告",
+            "不需要觀看廣告",
+            "does not require",
+            "no need to watch",
+            "without watching",
+        ],
+        8000,
+    )
+    ad_hint = wait_for_any_text(
+        page,
+        ["Watch 3 ads", "Watch ad", "Ad ready", "Rewarded ad", "Watch Ads"],
+        8000,
+    )
 
-    need = int(cfg["ads_per_extension"])
-    if watched < need:
-        log(f"警告: 仅完成 {watched}/{need} 个开机广告，尝试补看剩余…")
-        extra = watch_reward_ads(page, cfg, reason="开机广告-补看")
-        watched += extra
-        log(f"补看后合计: {watched}/{need}")
+    # 点完 Start 后可能已在 provisioning / running
+    early = api_state(cfg)
+    early_st = normalize_status(early.get("status"))
+    log(f"点击 Start 后状态: {early.get('status')}")
 
-    new_state = wait_until_running(cfg, timeout_sec=240)
+    if no_ad_hint and not ad_hint:
+        log(f"检测到无需广告提示: {no_ad_hint!r}，直接等待启动")
+    elif early_st in ("provisioning", "starting", "booting") or is_running(early_st):
+        log("已进入启动流程，跳过广告等待")
+    elif ad_hint:
+        log("开始处理开机广告（Watch 3 ads to start）…")
+        watched = watch_reward_ads(page, cfg, reason="开机广告")
+        if watched < 1:
+            log("开机广告一个都没点到，尝试再点一次 Start 后重试")
+            click_anywhere(page, labels, 10000, exact=False, force=True)
+            page.wait_for_timeout(3000)
+            watched = watch_reward_ads(page, cfg, reason="开机广告-重试")
+        need = int(cfg["ads_per_extension"])
+        if watched < need:
+            log(f"警告: 仅完成 {watched}/{need} 个开机广告，尝试补看…")
+            extra = watch_reward_ads(page, cfg, reason="开机广告-补看")
+            watched += extra
+            log(f"补看后合计: {watched}/{need}")
+    else:
+        log("未明确检测到广告弹窗，先等待是否直接启动…")
+        page.wait_for_timeout(15000)
+        mid = api_state(cfg)
+        if not is_running(mid.get("status")) and normalize_status(mid.get("status")) not in (
+            "provisioning",
+            "starting",
+            "booting",
+        ):
+            log("仍未启动，尝试走广告流程…")
+            watched = watch_reward_ads(page, cfg, reason="开机广告")
+            log(f"广告流程完成数: {watched}")
+
+    new_state = wait_until_running(cfg, timeout_sec=300)
     if new_state and is_running(new_state.get("status")):
         log(f"开机成功 → status={new_state.get('status')}")
         return True, new_state
 
-    log("开机后状态仍未变为 running")
-    return False, new_state or state
+    # provisioning 也可能长时间停留
+    st2 = normalize_status((new_state or early).get("status"))
+    log(f"开机后状态仍未变为 running（当前 {st2}）")
+    return False, new_state or early or state
 
 
 def try_extend_session(page, cfg, before: dict) -> tuple[bool, dict | None]:
