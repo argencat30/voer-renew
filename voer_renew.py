@@ -277,8 +277,8 @@ def fetch_account_email(cfg) -> str:
         return ""
 
 
-def notify_godlike(cfg, account, server_id, result, uptime_sec, status):
-    """按固定模板发送续期通知（纯文本）。"""
+def notify_godlike(cfg, account, server_id, result, uptime_sec, status, photo=None):
+    """按固定模板发送续期通知；若传入 photo 则附带真实面板截图。"""
     lines = [
         f"⏰运行时间: {fmt_local_time()}",
         f"🖥️账号: {account or '—'}",
@@ -287,7 +287,13 @@ def notify_godlike(cfg, account, server_id, result, uptime_sec, status):
         f"📊续期结果: {result}",
         f"📊开机状态: {status_text(status)}",
     ]
-    notify(cfg, cfg.get("tg_title") or "Godlike 续期通知", lines)
+    shot = None
+    if photo is not None:
+        shot = photo if isinstance(photo, pathlib.Path) else pathlib.Path(photo)
+        if not shot.exists():
+            log(f"通知截图不存在: {shot}")
+            shot = None
+    notify(cfg, cfg.get("tg_title") or "Godlike 续期通知", lines, photo=shot)
 
 
 # ---------------------------------------------------------------------------
@@ -507,10 +513,21 @@ def _shot_name(base: str) -> str:
 
 
 def take_screenshot(page, name="screenshot.png") -> pathlib.Path:
+    """截取当前浏览器真实页面（面板状态），供 Telegram 发送。"""
     path = pathlib.Path(_shot_name(name))
     try:
-        page.screenshot(path=str(path), full_page=True)
-        log(f"截图已保存: {path.resolve()}")
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+        try:
+            page.screenshot(path=str(path), full_page=True, type="png")
+        except Exception:
+            page.screenshot(path=str(path), full_page=False, type="png")
+        size = path.stat().st_size if path.exists() else 0
+        log(f"截图已保存: {path.resolve()} ({size} bytes)")
+        if size < 1000:
+            log("警告: 截图文件过小，可能是空白页")
     except Exception as e:
         log(f"截图失败: {e}")
     return path
@@ -586,6 +603,7 @@ def run_server(cfg, server_id, account=""):
     success = False
     before = {}
     now = {}
+    last_shot = None  # 结束时填入真实截图
     last_shot = pathlib.Path(_shot_name("renew_screenshot.png"))
     # 单次运行内最多连续续期几次（受平台每日 4 次 / 每会话 4 次上限约束）
     max_ext = max(1, int(cfg.get("extensions_per_run", 4)))
@@ -839,14 +857,33 @@ def run_server(cfg, server_id, account=""):
         if uptime is None:
             uptime = seconds_until(before.get("sessionExpiresAt"))
         result = f"✅续期成功（+{rounds_ok * 4}h，共 {rounds_ok} 次）"
-        notify_godlike(cfg, account, short_id, result, uptime, final_state.get("status"))
+        photo = last_shot if (last_shot is not None and last_shot.exists()) else None
+        if photo is None:
+            cand = pathlib.Path(_shot_name("renew_screenshot.png"))
+            photo = cand if cand.exists() else None
+        notify_godlike(
+            cfg, account, short_id, result, uptime, final_state.get("status"), photo=photo
+        )
         return True
     else:
         final_state = now or before
         uptime = seconds_until(final_state.get("sessionExpiresAt"))
         reason = stop_reason or "未检测到续期生效"
+        photo = last_shot if (last_shot is not None and last_shot.exists()) else None
+        if photo is None:
+            for name in ("renew_screenshot.png", "debug_screenshot.png"):
+                cand = pathlib.Path(_shot_name(name))
+                if cand.exists():
+                    photo = cand
+                    break
         notify_godlike(
-            cfg, account, short_id, f"⚠️续期未生效（{reason}）", uptime, final_state.get("status")
+            cfg,
+            account,
+            short_id,
+            f"⚠️续期未生效（{reason}）",
+            uptime,
+            final_state.get("status"),
+            photo=photo,
         )
         return False
 
