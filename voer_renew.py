@@ -259,8 +259,29 @@ def notify(cfg, title: str, lines: list, photo: pathlib.Path | None = None):
 # ---------------------------------------------------------------------------
 
 
+
+def _session_left_minutes(state: dict) -> float | None:
+    import datetime
+    exp_s = state.get("sessionExpiresAt")
+    if not exp_s:
+        return None
+    try:
+        s = str(exp_s).strip().replace("Z", "+00:00")
+        exp = datetime.datetime.fromisoformat(s)
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (exp.astimezone(datetime.timezone.utc) - now).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
 def _should_skip_extend_for_now(state: dict) -> bool:
-    """若仍在 running 且距离到期超过 lead+缓冲，则跳过续期。"""
+    """
+    若仍在 running 且距离到期还很长，则跳过续期。
+    默认：剩余 > 150 分钟才跳过（兼容每 1～2 小时的 schedule，避免漏续）。
+    可用环境变量 VOER_SKIP_IF_LEFT_MINUTES 覆盖。
+    """
     import datetime
     if not is_running(state.get("status")):
         return False
@@ -268,11 +289,10 @@ def _should_skip_extend_for_now(state: dict) -> bool:
     if not exp_s:
         return False
     try:
-        lead = int(os.environ.get("VOER_NEXT_RUN_LEAD_MINUTES", "45"))
+        # 剩余超过该分钟数才跳过；默认 150，避免「2 小时 cron + 60 分钟窗口」空窗漏续
+        window = int(os.environ.get("VOER_SKIP_IF_LEFT_MINUTES", "150"))
     except Exception:
-        lead = 45
-    # 额外缓冲 15 分钟：只在到期前 lead+15 分钟内才真正看广告续期
-    window = lead + 15
+        window = 150
     try:
         s = str(exp_s).strip().replace("Z", "+00:00")
         exp = datetime.datetime.fromisoformat(s)
@@ -280,7 +300,7 @@ def _should_skip_extend_for_now(state: dict) -> bool:
             exp = exp.replace(tzinfo=datetime.timezone.utc)
         now = datetime.datetime.now(datetime.timezone.utc)
         left_min = (exp.astimezone(datetime.timezone.utc) - now).total_seconds() / 60.0
-        log(f"距离到期约 {left_min:.0f} 分钟（窗口={window} 分钟内才续期）")
+        log(f"距离到期约 {left_min:.0f} 分钟（剩余 > {window} 分钟则跳过续期）")
         return left_min > window
     except Exception as e:
         log(f"解析到期时间失败，不跳过: {e}")
@@ -1096,6 +1116,10 @@ def main():
                 log("已设置 VOER_SKIP_EXTEND，跳过续期")
             elif power_ok is False and is_stopped(before.get("status")):
                 log("开机未成功且仍为 stopped，跳过续期")
+            elif power_ok is True and _session_left_minutes(before) is not None and _session_left_minutes(before) < 270:
+                # 刚开机拿到的新会话通常约 4 小时，立刻尝试续一次更稳妥
+                log("开机后会话仍较短，立即尝试续期…")
+                extend_ok, after = try_extend_session(page, cfg, before)
             elif _should_skip_extend_for_now(before):
                 log("距离到期仍较远，跳过本次续期（避免无意义看广告）")
                 extend_ok = None
