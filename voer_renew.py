@@ -793,25 +793,110 @@ def print_status(server):
 
 
 def click_anywhere(page, texts, timeout_ms, exact=True):
+    """在主页面及所有 iframe（含 wormies / googleads OOPIF）中查找并点击。"""
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
-        for frame in page.frames:
+        frames = list(page.frames)
+        for frame in frames:
             for t in texts:
                 makers = [
                     lambda t=t, f=frame: f.get_by_role("button", name=t, exact=exact).first,
+                    lambda t=t, f=frame: f.get_by_role("link", name=t, exact=exact).first,
                     lambda t=t, f=frame: f.get_by_text(t, exact=exact).first,
                     lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
                     lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"a:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"div[role='button']:has-text('{t}')").first,
+                    # 部分激励广告按钮是可点击的 span / div
+                    lambda t=t, f=frame: f.locator(f"span:text-is('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"div:text-is('{t}')").first,
                 ]
                 for maker in makers:
                     try:
                         loc = maker()
                         if loc.count() and loc.is_visible():
-                            loc.click(timeout=3000)
-                            return f"{t}@{frame.url[:60]}"
+                            # 滚动到可见再点，避免被遮挡
+                            try:
+                                loc.scroll_into_view_if_needed(timeout=2000)
+                            except Exception:
+                                pass
+                            try:
+                                loc.click(timeout=3000, force=False)
+                            except Exception:
+                                loc.click(timeout=3000, force=True)
+                            return f"{t}@{frame.url[:80]}"
                     except Exception:
                         pass
-        time.sleep(1.2)
+            # aria-label / title 匹配（Close 按钮常用）
+            for t in texts:
+                try:
+                    loc = frame.locator(
+                        f"button[aria-label='{t}'], [aria-label='{t}'], "
+                        f"button[title='{t}'], [title='{t}']"
+                    ).first
+                    if loc.count() and loc.is_visible():
+                        loc.click(timeout=3000, force=True)
+                        return f"aria:{t}@{frame.url[:80]}"
+                except Exception:
+                    pass
+        time.sleep(1.0)
+    return None
+
+
+def click_close_ad(page, timeout_ms=60000):
+    """关闭激励广告播放器。Google / 第三方广告关闭按钮样式很多。"""
+    close_labels = [
+        "Close",
+        "關閉",
+        "关闭",
+        "关闭广告",
+        "關閉廣告",
+        "Skip",
+        "Skip Ad",
+        "Skip ad",
+        "跳过",
+        "跳過",
+        "Done",
+        "完成",
+        "Continue",
+        "继续",
+        "繼續",
+        "OK",
+        "确定",
+        "確定",
+        "×",
+        "✕",
+        "X",
+    ]
+    hit = click_anywhere(page, close_labels, timeout_ms, exact=True)
+    if hit:
+        return hit
+    # 尝试点右上角常见关闭图标（无精确文字时）
+    deadline = time.time() + min(8, timeout_ms / 1000)
+    while time.time() < deadline:
+        for frame in page.frames:
+            selectors = [
+                "button[aria-label*='lose' i]",
+                "button[aria-label*='kip' i]",
+                "button[aria-label*='关闭']",
+                "button[aria-label*='關閉']",
+                "[class*='close' i][role='button']",
+                "button.close",
+                ".close-button",
+                "#dismiss-button",
+                ".videoAdUiSkipButton",
+                ".ytp-ad-skip-button",
+                "button[class*='skip' i]",
+            ]
+            for sel in selectors:
+                try:
+                    loc = frame.locator(sel).first
+                    if loc.count() and loc.is_visible():
+                        loc.click(timeout=2000, force=True)
+                        return f"css:{sel}@{frame.url[:60]}"
+                except Exception:
+                    pass
+        time.sleep(0.8)
     return None
 
 
@@ -879,28 +964,72 @@ def dump_page_debug(page, tag="debug"):
     log("----- 诊断结束 -----")
 
 
-def watch_ads_round(page, cfg, total, watch_labels):
-    """看完一轮激励广告（开机或续期共用）。返回看了几个。"""
+WATCH_AD_LABELS = [
+    "Watch ad",
+    "Watch Ad",
+    "Watch ads",
+    "Watch Ads",
+    "觀看廣告",
+    "观看广告",
+    "觀看廣告以繼續",
+    "观看广告以继续",
+]
+
+
+def watch_ads_round(page, cfg, total, watch_labels=None):
+    """看完一轮激励广告（开机或续期共用）。返回成功看完的个数。
+
+    流程每条广告：
+      1. 点击「Watch ad」
+      2. 等待播放时长（默认 ~32s，可配置）
+      3. 点击 Close / Skip / X 关闭播放器
+      4. 等待 UI 回到进度弹窗，再点下一条
+    """
+    labels = list(watch_labels or WATCH_AD_LABELS)
+    # 去重保持顺序
+    seen = set()
+    labels = [x for x in labels if not (x in seen or seen.add(x))]
     watched = 0
+    duration_ms = max(15, int(cfg.get("ad_duration_sec") or 32)) * 1000
+
     for i in range(1, total + 1):
-        hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告"], 75000)
+        log(f"等待第 {i}/{total} 个「Watch ad」按钮出现…")
+        hit = click_anywhere(page, labels, 90000, exact=True)
         if not hit:
-            log(f"第 {i} 个 Watch ad 未找到，停止")
+            # 宽松匹配再试一次
+            hit = click_anywhere(page, labels, 20000, exact=False)
+        if not hit:
+            log(f"第 {i} 个 Watch ad 未找到，停止（已看 {watched}/{total}）")
+            try:
+                dump_page_debug(page, f"missing_watch_ad_{i}")
+            except Exception:
+                pass
             break
-        log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
-        page.wait_for_timeout(int(cfg["ad_duration_sec"]) * 1000)
-        closed = click_anywhere(page, ["Close", "關閉", "关闭"], 60000)
-        log(
-            f"第 {i} 个广告:",
-            f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-        )
-        page.wait_for_timeout(6000)
+
+        log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），等待广告播放 {duration_ms // 1000}s…")
+        page.wait_for_timeout(duration_ms)
+
+        closed = click_close_ad(page, timeout_ms=45000)
+        if closed:
+            log(f"第 {i} 个广告已关闭（{closed}）")
+        else:
+            log(f"第 {i} 个广告未找到 Close，再等 8s 后继续（可能已自动关闭）")
+            page.wait_for_timeout(8000)
+            closed = click_close_ad(page, timeout_ms=10000)
+            if closed:
+                log(f"第 {i} 个广告延迟关闭成功（{closed}）")
+
+        # 关闭后给进度弹窗一点时间刷新（0/3 → 1/3 → …）
+        page.wait_for_timeout(5000)
         watched += 1
+        log(f"广告进度: 已完成 {watched}/{total}")
+
     return watched
 
 
-def playwright_start(page, cfg, server_id, watch_labels):
-    """面板里点 Start / 开机，必要时看广告。返回是否已 running。"""
+def playwright_start(page, cfg, server_id, watch_labels=None):
+    """面板里点 Start / 开机，必要时看完 3 条广告。返回是否已 running。"""
+    labels = list(watch_labels or WATCH_AD_LABELS)
     start_labels = [
         "Start server",
         "Start Server",
@@ -919,18 +1048,84 @@ def playwright_start(page, cfg, server_id, watch_labels):
     )
     if not hit:
         log("未找到开机按钮")
+        try:
+            dump_page_debug(page, "no_start_button")
+        except Exception:
+            pass
         return False
     log(f"已点击开机入口: {hit}")
-    page.wait_for_timeout(4000)
-    maybe = click_anywhere(page, watch_labels, 8000)
-    if maybe:
-        log(f"开机需要看广告，已点: {maybe}")
-        watch_ads_round(page, cfg, int(cfg["ads_per_extension"]), watch_labels)
+    page.wait_for_timeout(5000)
+
+    # 检测是否出现「Watch 3 ads to start」弹窗 / Watch ad 按钮
+    # 注意：不要提前点掉第一个 Watch ad，全部交给 watch_ads_round 计数
+    need_ads = False
+    probe = click_anywhere(page, labels, 12000, exact=True)
+    if probe:
+        # 点到了第一个 — 算作第 1 条已点，接着播完并关，再继续 2、3
+        need_ads = True
+        log(f"检测到开机广告弹窗，已点第 1 个 Watch ad（{probe}）")
+        duration_ms = max(15, int(cfg.get("ad_duration_sec") or 32)) * 1000
+        log(f"等待第 1 条广告播放 {duration_ms // 1000}s…")
+        page.wait_for_timeout(duration_ms)
+        closed = click_close_ad(page, timeout_ms=45000)
+        log(f"第 1 个广告: {'已关闭 (' + closed + ')' if closed else '未找到 Close，继续'}")
+        page.wait_for_timeout(5000)
+        rest = max(0, int(cfg.get("ads_per_extension") or 3) - 1)
+        if rest > 0:
+            log(f"继续观看剩余 {rest} 条广告…")
+            more = watch_ads_round(page, cfg, rest, labels)
+            watched = 1 + more
+        else:
+            watched = 1
+        log(f"开机广告合计观看: {watched}/{cfg.get('ads_per_extension', 3)}")
+    else:
+        # 可能不需要广告，或弹窗文案不同 — 再扫一次页面文字
+        try:
+            body = ""
+            for fr in page.frames:
+                try:
+                    body += (fr.inner_text("body", timeout=1500) or "") + "\n"
+                except Exception:
+                    pass
+            if any(
+                k in body
+                for k in (
+                    "Watch 3 ads",
+                    "Watch ad",
+                    "觀看廣告",
+                    "观看广告",
+                    "Rewarded ad",
+                    "start your free server",
+                )
+            ):
+                need_ads = True
+                log("页面文案显示需要看广告，但按钮暂未点到，重试完整一轮…")
+                watched = watch_ads_round(
+                    page, cfg, int(cfg.get("ads_per_extension") or 3), labels
+                )
+                log(f"开机广告合计观看: {watched}/{cfg.get('ads_per_extension', 3)}")
+            else:
+                log("未检测到广告弹窗，可能无需看广告即可开机")
+        except Exception as e:
+            log(f"探测广告弹窗异常: {e}")
+
+    # 看完广告后可能还要再点一次确认 / Start
+    page.wait_for_timeout(3000)
+    for confirm in ("Start", "Continue", "继续", "繼續", "OK", "确定", "確定", "完成", "Done"):
+        if click_anywhere(page, [confirm], 3000):
+            log(f"开机后确认点击: {confirm}")
+            page.wait_for_timeout(2000)
+            break
+
     waited = wait_until_running(cfg, server_id, cfg.get("power_wait_sec", 240))
     if waited and _status_of(waited) in RUNNING_STATUSES:
         log("面板开机完成，服务器已 running")
         return True
     log(f"面板开机后仍未 running，当前 {(waited or {}).get('status')}")
+    try:
+        dump_page_debug(page, "boot_still_stopped")
+    except Exception:
+        pass
     return False
 
 
