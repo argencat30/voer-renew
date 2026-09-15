@@ -74,7 +74,7 @@ DEFAULT_CONFIG = {
     "server_id": "在这里填服务器 UUID（面板地址 /panel/server/ 后面那串）",
     "token": "在这里填浏览器 Cookie 里 voer.host 的 token 值（JWT）",
     "ads_per_extension": 3,
-    "ad_duration_sec": 32,
+    "ad_duration_sec": 35,
     "extensions_per_run": 4,   # 单次运行内最多连续续期几次（受平台每日/每会话 4 次上限约束）
     "auto_restart": True,      # 关机 / 异常时先重启，再进入续期
     "power_wait_sec": 240,     # 等待开机进入 running 的秒数
@@ -843,52 +843,91 @@ def click_anywhere(page, texts, timeout_ms, exact=True):
     return None
 
 
+def _is_ad_frame(url: str) -> bool:
+    """是否广告相关 iframe（关闭按钮应优先在这里点，绝不能点面板主页面的 X）。"""
+    u = (url or "").lower()
+    keys = (
+        "googleads",
+        "doubleclick",
+        "googlesyndication",
+        "pagead",
+        "wormies.voer.host",
+        "adservice",
+        "adnxs",
+        "advertising",
+        "imasdk",
+        "tpc.googlesyndication",
+    )
+    return any(k in u for k in keys)
+
+
+def _is_panel_frame(url: str) -> bool:
+    u = (url or "").lower()
+    return "voer.host" in u and not _is_ad_frame(u)
+
+
 def click_close_ad(page, timeout_ms=60000):
-    """关闭激励广告播放器。Google / 第三方广告关闭按钮样式很多。"""
+    """关闭激励广告播放器。
+
+    关键：必须优先在 googleads / wormies 等广告 iframe 里点 Close。
+    绝不能点面板主页面「Watch Ads to Extend」弹窗右上角的 X —— 那会直接关掉整个续期弹窗，
+    进度仍停在 0/3，续期不会生效。
+    """
     close_labels = [
         "Close",
         "關閉",
         "关闭",
         "关闭广告",
         "關閉廣告",
-        "Skip",
-        "Skip Ad",
         "Skip ad",
+        "Skip Ad",
+        "Skip",
         "跳过",
         "跳過",
         "Done",
         "完成",
-        "Continue",
-        "继续",
-        "繼續",
-        "OK",
-        "确定",
-        "確定",
-        "×",
-        "✕",
-        "X",
     ]
-    hit = click_anywhere(page, close_labels, timeout_ms, exact=True)
-    if hit:
-        return hit
-    # 尝试点右上角常见关闭图标（无精确文字时）
-    deadline = time.time() + min(8, timeout_ms / 1000)
+    css_selectors = [
+        "button[aria-label*='lose' i]",
+        "button[aria-label*='Close' i]",
+        "button[aria-label*='kip' i]",
+        "button[aria-label*='关闭']",
+        "button[aria-label*='關閉']",
+        "#dismiss-button",
+        ".videoAdUiSkipButton",
+        ".ytp-ad-skip-button",
+        "button[class*='skip' i]",
+        "[class*='close-button' i]",
+        "button.close",
+    ]
+
+    deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
-        for frame in page.frames:
-            selectors = [
-                "button[aria-label*='lose' i]",
-                "button[aria-label*='kip' i]",
-                "button[aria-label*='关闭']",
-                "button[aria-label*='關閉']",
-                "[class*='close' i][role='button']",
-                "button.close",
-                ".close-button",
-                "#dismiss-button",
-                ".videoAdUiSkipButton",
-                ".ytp-ad-skip-button",
-                "button[class*='skip' i]",
-            ]
-            for sel in selectors:
+        frames = list(page.frames)
+        # 1) 优先广告 iframe
+        ordered = sorted(
+            frames,
+            key=lambda f: (0 if _is_ad_frame(f.url) else 1 if not _is_panel_frame(f.url) else 2),
+        )
+        for frame in ordered:
+            if _is_panel_frame(frame.url):
+                # 面板主页面：跳过，避免点到弹窗 X
+                continue
+            for t in close_labels:
+                makers = [
+                    lambda t=t, f=frame: f.get_by_role("button", name=t, exact=True).first,
+                    lambda t=t, f=frame: f.get_by_text(t, exact=True).first,
+                    lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
+                ]
+                for maker in makers:
+                    try:
+                        loc = maker()
+                        if loc.count() and loc.is_visible():
+                            loc.click(timeout=2500, force=True)
+                            return f"{t}@{frame.url[:80]}"
+                    except Exception:
+                        pass
+            for sel in css_selectors:
                 try:
                     loc = frame.locator(sel).first
                     if loc.count() and loc.is_visible():
@@ -896,7 +935,20 @@ def click_close_ad(page, timeout_ms=60000):
                         return f"css:{sel}@{frame.url[:60]}"
                 except Exception:
                     pass
-        time.sleep(0.8)
+        time.sleep(1.0)
+
+    # 2) 最后手段：仍不在面板上点 X；只在广告帧再试一次宽松匹配
+    for frame in page.frames:
+        if not _is_ad_frame(frame.url):
+            continue
+        for t in ("Close", "Skip", "×", "✕"):
+            try:
+                loc = frame.get_by_text(t, exact=False).first
+                if loc.count() and loc.is_visible():
+                    loc.click(timeout=2000, force=True)
+                    return f"loose:{t}@{frame.url[:60]}"
+            except Exception:
+                pass
     return None
 
 
@@ -1355,10 +1407,21 @@ def run_server(cfg, server_id, account=""):
                         f"面板开机成功 → {st_now}"
                     ).strip(" ·")
                     log(f"开机成功，status={st_now}")
+                    # 开机后等面板稳定，再读真实可续期次数，并等待「Extend」出现
+                    log("等待面板出现可续期入口（Extend）…")
+                    page.wait_for_timeout(8000)
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=60000)
+                        page.wait_for_timeout(5000)
+                    except Exception as e:
+                        log(f"刷新面板失败（继续）: {e}")
+                    before = api_state(cfg, server_id)
+                    quota = quota_from(before)
+                    log_quota(quota, "开机稳定后可续期次数（API 实时）")
                     # 新会话开启后本会话计数会重置；按最新剩余次数安排续期
                     if quota["remain"] > 0:
                         max_ext = min(max(1, int(cfg.get("extensions_per_run", 4))), quota["remain"])
-                        log(f"开机后计划再续期 {max_ext} 次（剩余 {quota['remain']}）")
+                        log(f"开机后计划再续期 {max_ext} 次（今日剩余 {quota['remain_today']}，本会话剩余 {quota['remain_session']}）")
                         skip_renew = False
                     else:
                         skip_renew = True
@@ -1373,14 +1436,14 @@ def run_server(cfg, server_id, account=""):
                             cfg,
                             account,
                             short_id,
-                            f"✅ 开机成功，跳过续期（{stop_reason}）",
+                            f"✅ 开机成功，跳过续期（次数已用完，下个工作日再试）",
                             seconds_until(before.get("sessionExpiresAt")),
                             before.get("status"),
                             photo=last_shot if last_shot.exists() else None,
                             quota=quota,
                             power_note=power_info.get("note"),
                         )
-                        return True  # 开机本身已成功
+                        return None  # 开机成功且无需续期 → 正常跳过，不报错
                 else:
                     stop_reason = f"面板开机失败，当前 status={st_now}"
                     log(stop_reason)
@@ -1460,53 +1523,84 @@ def run_server(cfg, server_id, account=""):
                     stop_reason = "找不到「延伸/续期」按钮"
                     break
                 log(f"已点击续期入口: {hit}")
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(5000)
+                # 不要在这里预点 Watch ad：全部交给 watch_ads_round，避免漏计 / 误关弹窗
+                if entered_direct:
+                    log("已通过 Watch ad 直接进入，继续看完本轮剩余广告…")
+                    # 直入时第 1 条可能已点，补看剩余
+                    duration_ms = max(15, int(cfg.get("ad_duration_sec") or 32)) * 1000
+                    page.wait_for_timeout(duration_ms)
+                    closed = click_close_ad(page, timeout_ms=45000)
+                    log(f"直入第 1 条广告: {'已关闭 (' + closed + ')' if closed else '未找到 Close'}")
+                    page.wait_for_timeout(5000)
+                    rest = max(0, int(cfg.get("ads_per_extension") or 3) - 1)
+                    watched = 1 + (watch_ads_round(page, cfg, rest, watch_labels) if rest else 0)
+                else:
+                    log("已打开续期弹窗，等待 Ad ready 后观看全部广告…")
+                    page.wait_for_timeout(6000)
+                    total = int(cfg.get("ads_per_extension") or 3)
+                    watched = watch_ads_round(page, cfg, total, watch_labels)
+                log(f"本轮广告观看完成: {watched}/{cfg.get('ads_per_extension', 3)}")
 
-                if not entered_direct:
-                    hit2 = click_anywhere(page, watch_labels, 30000)
-                    if not hit2:
-                        hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
-                    if not hit2:
-                        log("未找到「观看广告」按钮（可能已直接进入广告流程）")
-                    else:
-                        log(f"已点击观看广告: {hit2}")
-                log("已打开广告流程，等待 Ad ready…")
-                page.wait_for_timeout(8000)
-
-                total = int(cfg["ads_per_extension"])
-                watch_ads_round(page, cfg, total, watch_labels)
-
-                end = time.time() + 180
+                # 等平台结算，以 API 真实值为准判断是否生效
+                end = time.time() + 120
                 round_ok = False
+                now = cur
                 while time.time() < end:
                     try:
                         now = api_state(cfg, server_id)
                     except SystemExit:
+                        raise
+                    except Exception as e:
+                        log(f"轮询状态失败: {e}")
                         now = None
-                    except Exception:
-                        now = None
-                    if now and (
-                        now.get("sessionExtensions", 0) > cur.get("sessionExtensions", 0)
-                        or now.get("sessionExpiresAt") != cur.get("sessionExpiresAt")
-                    ):
-                        rounds_ok += 1
-                        round_ok = True
-                        success = True
-                        quota = quota_from(now)
-                        log(
-                            f"第 {round_no} 轮续期成功 -> 新到期: {now.get('sessionExpiresAt')}"
-                            f" | 累计: {now.get('sessionExtensions')} | 今日: {today_used(now)}"
+                    if now:
+                        ext_up = int(now.get("sessionExtensions") or 0) > int(
+                            cur.get("sessionExtensions") or 0
                         )
-                        log_quota(quota, "实时可续期次数")
-                        break
-                    time.sleep(10)
+                        exp_up = (now.get("sessionExpiresAt") or "") != (
+                            cur.get("sessionExpiresAt") or ""
+                        )
+                        if ext_up or exp_up:
+                            rounds_ok += 1
+                            round_ok = True
+                            success = True
+                            quota = quota_from(now)
+                            log(
+                                f"第 {round_no} 轮续期成功 -> 新到期: {now.get('sessionExpiresAt')}"
+                                f" | 累计: {now.get('sessionExtensions')} | 今日: {today_used(now)}"
+                            )
+                            log_quota(quota, "实时可续期次数（API）")
+                            break
+                    time.sleep(8)
                 if not round_ok:
-                    log(f"第 {round_no} 轮未检测到续期生效（广告未播完 / 页面卡住 / 已达上限），停止后续轮次")
+                    # 若广告没看够，明确提示；次数用完则正常停止不报错
+                    q_now = quota_from(now or cur)
+                    if q_now["remain"] <= 0:
+                        stop_reason = (
+                            f"次数已用完（今日 {q_now['used_today']}/{q_now['daily_limit']}，"
+                            f"本会话 {q_now['used_session']}/{q_now['session_limit']}）"
+                        )
+                        log(f"{stop_reason}，停止续期（正常跳过，不报错）")
+                        break
+                    log(
+                        f"第 {round_no} 轮未检测到续期生效"
+                        f"（本轮看了 {watched} 条广告；可能广告未完整播放或关闭按钮点错）"
+                    )
                     stop_reason = stop_reason or "本轮未检测到续期生效"
+                    try:
+                        dump_page_debug(page, f"extend_not_applied_{round_no}")
+                    except Exception:
+                        pass
                     now = now or cur
                     break
 
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(4000)
+                # 关闭可能残留的弹窗，准备下一轮
+                for dismiss in ("Close", "Cancel", "取消", "關閉", "关闭"):
+                    if click_anywhere(page, [dismiss], 2000):
+                        page.wait_for_timeout(1500)
+                        break
 
             last_shot = take_screenshot(page, "renew_screenshot.png")
             try:
@@ -1551,7 +1645,7 @@ def run_server(cfg, server_id, account=""):
 
     if success:
         result = f"✅续期成功（+{rounds_ok * 4}h，共 {rounds_ok} 次）"
-        log_quota(quota, "本轮结束可续期次数")
+        log_quota(quota, "本轮结束可续期次数（API 实时）")
         notify_godlike(
             cfg,
             account,
@@ -1565,7 +1659,43 @@ def run_server(cfg, server_id, account=""):
         )
         return True
 
+    # 次数用完 → 正常跳过，不报错（下个工作日同一流程再跑）
     reason = stop_reason or "未检测到续期生效"
+    if quota and quota.get("remain", 1) <= 0:
+        log(f"次数已用完，跳过：{reason}")
+        notify_godlike(
+            cfg,
+            account,
+            short_id,
+            f"⏭️ 次数已用完，已跳过（下个工作日再试）",
+            uptime,
+            final_state.get("status") if final_state else None,
+            photo=photo,
+            quota=quota,
+            power_note=power_info.get("note"),
+        )
+        return None
+
+    # 开机已成功但续期未生效：仍算部分成功（服务器在跑），返回 True 避免 CI 红灯
+    st_final = _status_of(final_state) if final_state else ""
+    if st_final in RUNNING_STATUSES and (
+        power_info.get("action") in ("start", "restart", "waited", "ads_required")
+        or "开机成功" in (power_info.get("note") or "")
+    ):
+        log(f"开机已成功，续期未生效（{reason}）；服务器在运行中，记为部分成功")
+        notify_godlike(
+            cfg,
+            account,
+            short_id,
+            f"⚠️ 开机成功，续期未生效（{reason}）",
+            uptime,
+            final_state.get("status"),
+            photo=photo,
+            quota=quota,
+            power_note=power_info.get("note"),
+        )
+        return True
+
     notify_godlike(
         cfg,
         account,
@@ -1615,18 +1745,20 @@ def main():
     log("=" * 60)
     log("全部服务器处理完毕，结果汇总:")
     fail = 0
+    skip = 0
     for sid, ok in results:
         if ok is True:
             mark = "✅ 成功"
         elif ok is None:
-            mark = "⏭️ 跳过（4 次已用完，仅检查关机/重启）"
+            mark = "⏭️ 跳过（次数已用完 / 无需续期，下个工作日再试）"
+            skip += 1
         else:
             mark = "❌ 失败"
-        if ok is False:
             fail += 1
         log(f"  {mark}  {sid[:8]}…")
-    log(f"合计: 成功/跳过 {total - fail}/{total} 台（失败 {fail} 台）")
+    log(f"合计: 成功 {total - fail - skip}/{total} · 跳过 {skip} · 失败 {fail}")
     log("=" * 60)
+    # 仅真实失败才非 0 退出；跳过（次数用完）视为正常
     if fail:
         sys.exit(3)
 
