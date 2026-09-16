@@ -866,7 +866,8 @@ def _is_panel_frame(url: str) -> bool:
     return "voer.host" in u and not _is_ad_frame(u)
 
 
-# Google 激励广告中间页（截图里的 Unlock more content）
+# Google 激励广告中间页（Unlock more content → View a short ad）
+# 禁止把泛化「Continue」放进主列表：wormies 页常驻 Continue 会导致死循环狂点并不断重置计时
 SURVEY_AD_LABELS = [
     "View a short ad",
     "View a short Ad",
@@ -874,44 +875,34 @@ SURVEY_AD_LABELS = [
     "Watch a short ad",
     "Watch short ad",
     "Site-wide access for 24 hours",
-    "Site-wide access",
-    "Unlock more content",
-    "Continue",
-    "继续",
-    "繼續",
 ]
 
 
-def click_survey_gate(page) -> str | None:
-    """处理「Unlock more content / View a short ad」中间页。
-
-    续期时经常出现：点了 Watch ad 后先出这个调查/许可页，
-    必须点「View a short ad」才会真正播视频并出现 #dismiss-button。
-    可在任意 frame（含面板弹层）点击。
-    """
+def click_survey_gate(page, already: set | None = None) -> str | None:
+    """只点「View a short ad」类中间页选项，避免反复点 Continue。"""
+    if already is None:
+        already = set()
     labels = SURVEY_AD_LABELS
     for frame in page.frames:
         for t in labels:
+            key = f"{t}|{(frame.url or '')[:50]}"
+            if key in already:
+                continue
             makers = [
                 lambda t=t, f=frame: f.get_by_role("button", name=t, exact=False).first,
-                lambda t=t, f=frame: f.get_by_text(t, exact=False).first,
+                lambda t=t, f=frame: f.get_by_text(t, exact=True).first,
                 lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
                 lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
                 lambda t=t, f=frame: f.locator(f"label:has-text('{t}')").first,
-                lambda t=t, f=frame: f.locator(f"div:has-text('{t}')").first,
             ]
             for maker in makers:
                 try:
                     loc = maker()
                     if not (loc.count() and loc.is_visible()):
                         continue
-                    # 避免点到整块大容器：优先小一点的可点击元素
                     try:
                         box = loc.bounding_box()
-                        if box and box.get("height", 0) > 200 and t not in (
-                            "View a short ad",
-                            "Watch a short ad",
-                        ):
+                        if box and box.get("height", 0) > 120:
                             continue
                     except Exception:
                         pass
@@ -923,27 +914,30 @@ def click_survey_gate(page) -> str | None:
                         loc.click(timeout=2500)
                     except Exception:
                         loc.click(timeout=2500, force=True)
+                    already.add(key)
                     return f"{t}@{frame.url[:70]}"
                 except Exception:
                     pass
-        # 单选圆点 + 文案（截图里的 radio）
         try:
-            radio = frame.locator(
-                "input[type='radio'], [role='radio'], .UPeD0c, [class*='radio' i]"
-            ).first
-            if radio.count() and radio.is_visible():
-                radio.click(timeout=2000, force=True)
-                page.wait_for_timeout(500)
-                # 再点确认类按钮
-                for t in ("Continue", "继续", "OK", "View a short ad"):
-                    try:
-                        b = frame.get_by_role("button", name=t, exact=False).first
-                        if b.count() and b.is_visible():
-                            b.click(timeout=2000)
-                            return f"radio+{t}@{frame.url[:60]}"
-                    except Exception:
-                        pass
-                return f"radio@{frame.url[:60]}"
+            for t in ("Site-wide access for 24 hours", "View a short ad", "Watch a short ad"):
+                key = f"label:{t}|{(frame.url or '')[:50]}"
+                if key in already:
+                    continue
+                lab = frame.locator(f"label:has-text('{t}')").first
+                if lab.count() and lab.is_visible():
+                    lab.click(timeout=2000, force=True)
+                    already.add(key)
+                    page.wait_for_timeout(400)
+                    for conf in ("View a short ad", "Watch a short ad", "Watch ad"):
+                        try:
+                            b = frame.get_by_role("button", name=conf, exact=False).first
+                            if b.count() and b.is_visible():
+                                b.click(timeout=2000)
+                                already.add(f"btn:{conf}|{(frame.url or '')[:50]}")
+                                return f"label+{conf}@{frame.url[:60]}"
+                        except Exception:
+                            pass
+                    return f"label:{t}@{frame.url[:60]}"
         except Exception:
             pass
     return None
@@ -986,14 +980,17 @@ def click_close_ad(page, timeout_ms=60000):
     ]
 
     deadline = time.time() + timeout_ms / 1000
+    survey_already = set()
+    survey_hits = 0
     while time.time() < deadline:
-        # 0) 中间页：View a short ad（可能多次出现）
-        gate = click_survey_gate(page)
-        if gate:
-            log(f"已点击广告中间页: {gate}")
-            page.wait_for_timeout(2500)
-            # 点完中间页后视频才开始，需要再等一会儿才能出现 dismiss
-            continue
+        # 0) 中间页：最多点 2 次，避免 Continue 类误匹配死循环
+        if survey_hits < 2:
+            gate = click_survey_gate(page, already=survey_already)
+            if gate:
+                survey_hits += 1
+                log(f"已点击广告中间页: {gate}")
+                page.wait_for_timeout(2500)
+                continue
 
         frames = list(page.frames)
         ordered = sorted(
@@ -1267,34 +1264,40 @@ def watch_ads_round(page, cfg, total, watch_labels=None):
                 page.wait_for_timeout(3000)
                 continue
 
-        # 播放等待期间轮询：中间页 / dismiss 按钮
-        log(f"广告播放中，等待最多 {duration_ms // 1000}s（期间处理中间页）…")
+        # 播放等待期间：最多点一次「View a short ad」，再等视频，再关
+        log(f"广告播放中，等待最多 {duration_ms // 1000}s（如有中间页只点一次）…")
+        survey_done = set()
+        gate = click_survey_gate(page, already=survey_done)
+        if gate:
+            log(f"点到中间广告选项: {gate}，开始等待视频…")
+            page.wait_for_timeout(2000)
         play_deadline = time.time() + duration_ms / 1000
         closed = None
         while time.time() < play_deadline:
-            gate = click_survey_gate(page)
-            if gate:
-                log(f"播放中点到中间页: {gate}，重新计时等待视频…")
-                # 点完中间页后视频才真正开始
-                play_deadline = time.time() + duration_ms / 1000
-                page.wait_for_timeout(2000)
-                continue
-            # 若 dismiss 提前出现，可以直接关
-            closed = click_close_ad(page, timeout_ms=1500)
+            # 仅当还没点过时再尝试中间页（防死循环）
+            if not survey_done:
+                gate = click_survey_gate(page, already=survey_done)
+                if gate:
+                    log(f"点到中间广告选项: {gate}，重新计时等待视频…")
+                    play_deadline = time.time() + duration_ms / 1000
+                    page.wait_for_timeout(2000)
+                    continue
+            # 提前出现 dismiss 则关闭
+            closed = click_close_ad(page, timeout_ms=1200)
             if closed:
                 log(f"第 {i} 个广告提前可关闭（{closed}）")
                 break
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(800)
 
         if not closed:
-            closed = click_close_ad(page, timeout_ms=50000)
+            closed = click_close_ad(page, timeout_ms=45000)
         if closed:
             log(f"第 {i} 个广告已关闭（{closed}）")
         else:
-            log("未找到广告帧 Close，再试中间页 + 关闭…")
-            gate = click_survey_gate(page)
+            log("未找到广告帧 Close，再试一次中间页 + 关闭…")
+            gate = click_survey_gate(page, already=survey_done)
             if gate:
-                log(f"补点中间页: {gate}")
+                log(f"补点中间广告: {gate}")
                 page.wait_for_timeout(duration_ms)
             closed = click_close_ad(page, timeout_ms=20000)
             if closed:
