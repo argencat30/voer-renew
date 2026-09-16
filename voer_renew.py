@@ -1028,53 +1028,175 @@ WATCH_AD_LABELS = [
 ]
 
 
+def click_watch_ad(page, labels, timeout_ms=90000):
+    """优先在 wormies 广告框里点「Watch ad」，其次才在面板弹窗里点。
+
+    开机成功案例：Watch ad@wormies.voer.host → Close@googleads
+    续期失败案例：Watch ad@voer.host/panel → 从未出现 googleads → 进度 0/3
+    """
+    deadline = time.time() + timeout_ms / 1000
+    labels = list(labels or WATCH_AD_LABELS)
+
+    def try_click_in_frames(prefer_ad: bool):
+        frames = list(page.frames)
+        if prefer_ad:
+            frames = sorted(
+                frames,
+                key=lambda f: (
+                    0
+                    if "wormies" in (f.url or "").lower()
+                    else 1
+                    if _is_ad_frame(f.url)
+                    else 2
+                ),
+            )
+        else:
+            frames = sorted(
+                frames,
+                key=lambda f: (0 if _is_panel_frame(f.url) else 1),
+            )
+        for frame in frames:
+            if prefer_ad and _is_panel_frame(frame.url):
+                continue
+            for t in labels:
+                makers = [
+                    lambda t=t, f=frame: f.get_by_role("button", name=t, exact=True).first,
+                    lambda t=t, f=frame: f.get_by_text(t, exact=True).first,
+                    lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
+                ]
+                for maker in makers:
+                    try:
+                        loc = maker()
+                        if loc.count() and loc.is_visible():
+                            try:
+                                loc.scroll_into_view_if_needed(timeout=2000)
+                            except Exception:
+                                pass
+                            try:
+                                loc.click(timeout=3000)
+                            except Exception:
+                                loc.click(timeout=3000, force=True)
+                            return f"{t}@{frame.url[:80]}"
+                    except Exception:
+                        pass
+        return None
+
+    while time.time() < deadline:
+        # 1) 优先 wormies / 广告 iframe
+        hit = try_click_in_frames(prefer_ad=True)
+        if hit:
+            return hit
+        # 2) 再试面板弹窗里的绿色按钮
+        hit = try_click_in_frames(prefer_ad=False)
+        if hit:
+            return hit
+        time.sleep(1.0)
+    return None
+
+
+def wait_for_ad_player(page, timeout_ms=25000) -> bool:
+    """点击 Watch ad 后，等待 googleads / 广告播放器 iframe 出现。"""
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        for frame in page.frames:
+            u = (frame.url or "").lower()
+            if any(
+                k in u
+                for k in (
+                    "googleads",
+                    "doubleclick",
+                    "pagead",
+                    "googlesyndication",
+                    "imasdk",
+                )
+            ):
+                log(f"广告播放器已出现: {frame.url[:80]}")
+                return True
+        # 有时 dismiss 按钮先出现
+        for frame in page.frames:
+            if not _is_ad_frame(frame.url):
+                continue
+            try:
+                loc = frame.locator("#dismiss-button, button[aria-label*='lose' i]").first
+                if loc.count() and loc.is_visible():
+                    log(f"广告关闭按钮已出现: {frame.url[:60]}")
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.8)
+    return False
+
+
 def watch_ads_round(page, cfg, total, watch_labels=None):
     """看完一轮激励广告（开机或续期共用）。返回成功看完的个数。
 
-    流程每条广告：
-      1. 点击「Watch ad」
-      2. 等待播放时长（默认 ~32s，可配置）
-      3. 点击 Close / Skip / X 关闭播放器
-      4. 等待 UI 回到进度弹窗，再点下一条
+    只有「点到 Watch ad → 出现 googleads 播放器 → 点到广告帧 Close」才算 1 条有效。
+    否则不计入，避免进度 0/3 却误报看完 3 条。
     """
     labels = list(watch_labels or WATCH_AD_LABELS)
-    # 去重保持顺序
     seen = set()
     labels = [x for x in labels if not (x in seen or seen.add(x))]
     watched = 0
-    duration_ms = max(15, int(cfg.get("ad_duration_sec") or 32)) * 1000
+    duration_ms = max(20, int(cfg.get("ad_duration_sec") or 35)) * 1000
 
     for i in range(1, total + 1):
         log(f"等待第 {i}/{total} 个「Watch ad」按钮出现…")
-        hit = click_anywhere(page, labels, 90000, exact=True)
+        hit = click_watch_ad(page, labels, timeout_ms=90000)
         if not hit:
-            # 宽松匹配再试一次
-            hit = click_anywhere(page, labels, 20000, exact=False)
-        if not hit:
-            log(f"第 {i} 个 Watch ad 未找到，停止（已看 {watched}/{total}）")
+            log(f"第 {i} 个 Watch ad 未找到，停止（有效已看 {watched}/{total}）")
             try:
                 dump_page_debug(page, f"missing_watch_ad_{i}")
             except Exception:
                 pass
             break
 
-        log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），等待广告播放 {duration_ms // 1000}s…")
+        log(f"已点击第 {i}/{total} 个 Watch ad（{hit}）")
+        # 必须等真实广告播放器出来，否则 32s 空等也没用
+        player_ok = wait_for_ad_player(page, timeout_ms=20000)
+        if not player_ok:
+            log("未检测到 googleads 广告播放器，再点一次 Watch ad 重试…")
+            page.wait_for_timeout(2000)
+            hit2 = click_watch_ad(page, labels, timeout_ms=15000)
+            if hit2:
+                log(f"重试点击 Watch ad（{hit2}）")
+            player_ok = wait_for_ad_player(page, timeout_ms=20000)
+
+        if not player_ok:
+            log(f"第 {i} 条广告播放器仍未出现，本条不计为有效")
+            try:
+                dump_page_debug(page, f"no_ad_player_{i}")
+            except Exception:
+                pass
+            # 不 break，给下一条机会；但若连续失败可停止
+            page.wait_for_timeout(3000)
+            continue
+
+        log(f"广告播放中，等待 {duration_ms // 1000}s…")
         page.wait_for_timeout(duration_ms)
 
-        closed = click_close_ad(page, timeout_ms=45000)
+        closed = click_close_ad(page, timeout_ms=50000)
         if closed:
             log(f"第 {i} 个广告已关闭（{closed}）")
         else:
-            log(f"第 {i} 个广告未找到 Close，再等 8s 后继续（可能已自动关闭）")
-            page.wait_for_timeout(8000)
-            closed = click_close_ad(page, timeout_ms=10000)
+            log("未找到广告帧 Close，再等 10s…")
+            page.wait_for_timeout(10000)
+            closed = click_close_ad(page, timeout_ms=15000)
             if closed:
                 log(f"第 {i} 个广告延迟关闭成功（{closed}）")
+            else:
+                log(f"第 {i} 条广告未能在广告帧关闭，本条可能无效")
+                try:
+                    dump_page_debug(page, f"no_ad_close_{i}")
+                except Exception:
+                    pass
+                page.wait_for_timeout(3000)
+                continue
 
-        # 关闭后给进度弹窗一点时间刷新（0/3 → 1/3 → …）
-        page.wait_for_timeout(5000)
+        # 只有成功关闭广告帧才计数
         watched += 1
-        log(f"广告进度: 已完成 {watched}/{total}")
+        log(f"有效广告进度: {watched}/{total}")
+        page.wait_for_timeout(6000)
 
     return watched
 
@@ -1108,58 +1230,62 @@ def playwright_start(page, cfg, server_id, watch_labels=None):
     log(f"已点击开机入口: {hit}")
     page.wait_for_timeout(5000)
 
-    # 检测是否出现「Watch 3 ads to start」弹窗 / Watch ad 按钮
-    # 注意：不要提前点掉第一个 Watch ad，全部交给 watch_ads_round 计数
+    # 统一走 watch_ads_round（优先 wormies → 等 googleads → dismiss）
     need_ads = False
-    probe = click_anywhere(page, labels, 12000, exact=True)
+    try:
+        body = ""
+        for fr in page.frames:
+            try:
+                body += (fr.inner_text("body", timeout=1500) or "") + "\n"
+            except Exception:
+                pass
+        if any(
+            k in body
+            for k in (
+                "Watch 3 ads",
+                "Watch ad",
+                "觀看廣告",
+                "观看广告",
+                "Rewarded ad",
+                "start your free server",
+                "Watch Ads",
+            )
+        ):
+            need_ads = True
+    except Exception as e:
+        log(f"探测广告弹窗异常: {e}")
+
+    # 即使文案探测失败，也尝试点一次 Watch ad（开机几乎总是要广告）
+    probe = click_watch_ad(page, labels, timeout_ms=12000)
     if probe:
-        # 点到了第一个 — 算作第 1 条已点，接着播完并关，再继续 2、3
         need_ads = True
-        log(f"检测到开机广告弹窗，已点第 1 个 Watch ad（{probe}）")
-        duration_ms = max(15, int(cfg.get("ad_duration_sec") or 32)) * 1000
-        log(f"等待第 1 条广告播放 {duration_ms // 1000}s…")
-        page.wait_for_timeout(duration_ms)
-        closed = click_close_ad(page, timeout_ms=45000)
-        log(f"第 1 个广告: {'已关闭 (' + closed + ')' if closed else '未找到 Close，继续'}")
-        page.wait_for_timeout(5000)
-        rest = max(0, int(cfg.get("ads_per_extension") or 3) - 1)
-        if rest > 0:
-            log(f"继续观看剩余 {rest} 条广告…")
-            more = watch_ads_round(page, cfg, rest, labels)
-            watched = 1 + more
+        log(f"检测到开机广告，交由完整看广告流程（先不单独计第 1 条）")
+        # 若已点到，补完播放+关闭，再看剩余
+        player_ok = wait_for_ad_player(page, timeout_ms=20000)
+        if player_ok:
+            duration_ms = max(20, int(cfg.get("ad_duration_sec") or 35)) * 1000
+            log(f"第 1 条广告播放中，等待 {duration_ms // 1000}s…")
+            page.wait_for_timeout(duration_ms)
+            closed = click_close_ad(page, timeout_ms=50000)
+            log(f"第 1 个广告: {'已关闭 (' + closed + ')' if closed else '未找到 Close'}")
+            page.wait_for_timeout(6000)
+            rest = max(0, int(cfg.get("ads_per_extension") or 3) - (1 if closed else 0))
+            more = watch_ads_round(page, cfg, rest, labels) if rest else 0
+            watched = (1 if closed else 0) + more
         else:
-            watched = 1
-        log(f"开机广告合计观看: {watched}/{cfg.get('ads_per_extension', 3)}")
+            log("第 1 次点击后未出现播放器，改走完整 watch_ads_round")
+            watched = watch_ads_round(
+                page, cfg, int(cfg.get("ads_per_extension") or 3), labels
+            )
+        log(f"开机广告有效观看: {watched}/{cfg.get('ads_per_extension', 3)}")
+    elif need_ads:
+        log("页面显示需要广告，开始完整观看…")
+        watched = watch_ads_round(
+            page, cfg, int(cfg.get("ads_per_extension") or 3), labels
+        )
+        log(f"开机广告有效观看: {watched}/{cfg.get('ads_per_extension', 3)}")
     else:
-        # 可能不需要广告，或弹窗文案不同 — 再扫一次页面文字
-        try:
-            body = ""
-            for fr in page.frames:
-                try:
-                    body += (fr.inner_text("body", timeout=1500) or "") + "\n"
-                except Exception:
-                    pass
-            if any(
-                k in body
-                for k in (
-                    "Watch 3 ads",
-                    "Watch ad",
-                    "觀看廣告",
-                    "观看广告",
-                    "Rewarded ad",
-                    "start your free server",
-                )
-            ):
-                need_ads = True
-                log("页面文案显示需要看广告，但按钮暂未点到，重试完整一轮…")
-                watched = watch_ads_round(
-                    page, cfg, int(cfg.get("ads_per_extension") or 3), labels
-                )
-                log(f"开机广告合计观看: {watched}/{cfg.get('ads_per_extension', 3)}")
-            else:
-                log("未检测到广告弹窗，可能无需看广告即可开机")
-        except Exception as e:
-            log(f"探测广告弹窗异常: {e}")
+        log("未检测到广告弹窗，可能无需看广告即可开机")
 
     # 看完广告后可能还要再点一次确认 / Start
     page.wait_for_timeout(3000)
@@ -1523,24 +1649,32 @@ def run_server(cfg, server_id, account=""):
                     stop_reason = "找不到「延伸/续期」按钮"
                     break
                 log(f"已点击续期入口: {hit}")
-                page.wait_for_timeout(5000)
-                # 不要在这里预点 Watch ad：全部交给 watch_ads_round，避免漏计 / 误关弹窗
+                page.wait_for_timeout(6000)
+                # 全部交给 watch_ads_round：优先 wormies 点 Watch ad → 等 googleads → dismiss
+                need = int(cfg.get("ads_per_extension") or 3)
                 if entered_direct:
-                    log("已通过 Watch ad 直接进入，继续看完本轮剩余广告…")
-                    # 直入时第 1 条可能已点，补看剩余
-                    duration_ms = max(15, int(cfg.get("ad_duration_sec") or 32)) * 1000
-                    page.wait_for_timeout(duration_ms)
-                    closed = click_close_ad(page, timeout_ms=45000)
-                    log(f"直入第 1 条广告: {'已关闭 (' + closed + ')' if closed else '未找到 Close'}")
-                    page.wait_for_timeout(5000)
-                    rest = max(0, int(cfg.get("ads_per_extension") or 3) - 1)
-                    watched = 1 + (watch_ads_round(page, cfg, rest, watch_labels) if rest else 0)
+                    log("已通过 Watch ad 直入，检查是否已进入广告播放器…")
+                    if wait_for_ad_player(page, timeout_ms=15000):
+                        duration_ms = max(20, int(cfg.get("ad_duration_sec") or 35)) * 1000
+                        page.wait_for_timeout(duration_ms)
+                        closed = click_close_ad(page, timeout_ms=50000)
+                        log(f"直入第 1 条: {'已关闭 (' + closed + ')' if closed else '无效'}")
+                        page.wait_for_timeout(6000)
+                        rest = need - (1 if closed else 0)
+                        watched = (1 if closed else 0) + (
+                            watch_ads_round(page, cfg, rest, watch_labels) if rest > 0 else 0
+                        )
+                    else:
+                        watched = watch_ads_round(page, cfg, need, watch_labels)
                 else:
-                    log("已打开续期弹窗，等待 Ad ready 后观看全部广告…")
-                    page.wait_for_timeout(6000)
-                    total = int(cfg.get("ads_per_extension") or 3)
-                    watched = watch_ads_round(page, cfg, total, watch_labels)
-                log(f"本轮广告观看完成: {watched}/{cfg.get('ads_per_extension', 3)}")
+                    log("已打开续期弹窗，等待 Ad ready 后观看全部广告（必须出现 googleads）…")
+                    watched = watch_ads_round(page, cfg, need, watch_labels)
+                log(f"本轮有效广告: {watched}/{need}")
+                if watched < need:
+                    log(
+                        f"有效广告不足 {need} 条（只完成 {watched}），"
+                        f"平台通常不会给 +4h，本轮可能无法生效"
+                    )
 
                 # 等平台结算，以 API 真实值为准判断是否生效
                 end = time.time() + 120
