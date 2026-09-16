@@ -881,6 +881,77 @@ def take_screenshot(page, name="screenshot.png") -> pathlib.Path:
     return path
 
 
+def capture_panel_shot(cfg, server_id: str, name: str = "skip_screenshot.png"):
+    """短暂打开面板截一张真实截图（用于跳过时的 TG 通知）。失败返回 None。"""
+    url = f"https://voer.host/panel/server/{server_id}"
+    path = pathlib.Path(_shot_name(name))
+    try:
+        with sync_playwright() as p:
+            launch = dict(
+                headless=cfg.get("headless", False),
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1400,1000",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            if cfg.get("use_system_chrome"):
+                launch["channel"] = "chrome"
+            browser = p.chromium.launch(**launch)
+            try:
+                ctx = browser.new_context(viewport={"width": 1400, "height": 1000})
+                ctx.add_cookies(
+                    [
+                        {
+                            "name": "token",
+                            "value": cfg["token"],
+                            "domain": "voer.host",
+                            "path": "/",
+                            "secure": True,
+                        }
+                    ]
+                )
+                page = ctx.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=12000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(3000)
+                take_screenshot(page, name)
+            finally:
+                browser.close()
+        if path.exists() and path.stat().st_size >= 1000:
+            return path
+        return path if path.exists() else None
+    except Exception as e:
+        log(f"跳过流程截图失败（不影响跳过本身）: {e}")
+        return None
+
+
+def notify_skip(cfg, account, server_id, server: dict, reason: str):
+    """跳过时发送 TG 通知并尽量附带面板截图。不抛错。"""
+    short_id = (server_id or "")[:8] + "…"
+    q = quota(server) if server else {}
+    uptime = seconds_until((server or {}).get("sessionExpiresAt"))
+    remaining_text = fmt_quota(q) if q else "—"
+    next_text = fmt_next_renewal((server or {}).get("sessionExpiresAt"))
+    log(f"跳过原因: {reason}")
+    log(f"发送跳过通知（含截图）… 下次续期: {next_text}")
+    shot = capture_panel_shot(cfg, server_id, name="skip_screenshot.png")
+    notify_godlike(
+        cfg,
+        account,
+        short_id,
+        f"⏭️跳过（{reason}）",
+        uptime,
+        (server or {}).get("status"),
+        photo=shot,
+        remaining_text=remaining_text + "\n📅下次续期: " + next_text,
+    )
+
+
 def dump_page_debug(page, tag="debug"):
     log(f"----- 页面诊断 ({tag}) -----")
     log(f"URL: {page.url}")
@@ -964,29 +1035,61 @@ def run_server(cfg, server_id, account=""):
         log(f"预检 API 失败: {e}，将继续尝试完整流程")
         pre = {}
 
+    pre_was_expired = bool(
+        pre and pre.get("sessionExpiresAt") and is_expired(pre.get("sessionExpiresAt"))
+    )
+
     if pre:
         q_pre = quota(pre)
         log_quota(pre, prefix="预检")
         log(f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}")
         log(f"开机状态: {pre.get('status')} — {status_text(pre.get('status'))}")
 
-        if q_pre["remaining"] <= 0:
+        # 无次数 + 仍在运行 + 未到期 → 无可操作，跳过（TG+截图，不报错）
+        if q_pre["remaining"] <= 0 and is_running(pre) and not pre_was_expired:
             log(
                 f"可续期次数为 0（今日 {q_pre['used_today']}/{MAX_DAILY_EXTENSIONS}"
                 f" · 会话 {q_pre['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
             )
+            try:
+                notify_skip(
+                    cfg,
+                    account,
+                    server_id,
+                    pre,
+                    "无可用次数",
+                )
+            except Exception as e:
+                log(f"跳过通知发送失败（不影响结果）: {e}")
             return None
 
-        # 未到期：只记录准确时间，不执行续期
-        if pre.get("sessionExpiresAt") and not is_expired(pre.get("sessionExpiresAt")):
-            # 若已关机仍需开机，继续往下；否则跳过续期
-            if not is_stopped(pre):
-                log(
-                    "会话尚未到期，跳过续期（不报错）。"
-                    f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}"
+        # 未到期 + 有次数 + 在运行 → 按「到期后才续期」跳过（TG+截图）
+        if (
+            pre.get("sessionExpiresAt")
+            and not pre_was_expired
+            and q_pre["remaining"] > 0
+            and not is_stopped(pre)
+        ):
+            log(
+                "会话尚未到期，跳过续期（不报错）。"
+                f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}"
+            )
+            try:
+                notify_skip(
+                    cfg,
+                    account,
+                    server_id,
+                    pre,
+                    "尚未到期",
                 )
-                return None
+            except Exception as e:
+                log(f"跳过通知发送失败（不影响结果）: {e}")
+            return None
+
+        if is_stopped(pre) and not pre_was_expired:
             log("会话尚未到期，但服务器已关机，将仅执行开机（不续期）")
+        if pre_was_expired:
+            log("会话已到期，将开机（如需要）并尝试续期")
 
     success = False
     before = {}
@@ -997,10 +1100,11 @@ def run_server(cfg, server_id, account=""):
     max_ext = max(1, int(cfg.get("extensions_per_run", 4)))
     rounds_ok = 0
     stop_reason = ""
+    # 仅当「预检时未到期且已关机」时，开机后不续期
     only_power_on = bool(
         pre
         and pre.get("sessionExpiresAt")
-        and not is_expired(pre.get("sessionExpiresAt"))
+        and not pre_was_expired
         and is_stopped(pre)
     )
 
@@ -1097,13 +1201,30 @@ def run_server(cfg, server_id, account=""):
                 log_quota(before, prefix="开机后检查")
                 log(f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}")
 
-            # 可续期次数为 0 → 跳过，不报错
+            # 可续期次数为 0 → 跳过（TG+截图，不报错）
+            # 若预检时已到期，开机后可能换了新会话，次数可能已刷新，故不在此处拦截
             q_now = quota(before)
-            if q_now["remaining"] <= 0:
+            if q_now["remaining"] <= 0 and not pre_was_expired:
                 log(
                     f"可续期次数为 0（今日 {q_now['used_today']}/{MAX_DAILY_EXTENSIONS}"
                     f" · 会话 {q_now['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
                 )
+                shot = take_screenshot(page, "skip_screenshot.png")
+                try:
+                    notify_godlike(
+                        cfg,
+                        account,
+                        short_id,
+                        "⏭️跳过（无可用次数）",
+                        seconds_until(before.get("sessionExpiresAt")),
+                        before.get("status"),
+                        photo=shot,
+                        remaining_text=fmt_quota(q_now)
+                        + "\n📅下次续期: "
+                        + fmt_next_renewal(before.get("sessionExpiresAt")),
+                    )
+                except Exception as e:
+                    log(f"跳过通知发送失败（不影响结果）: {e}")
                 return None
             if int(before.get("sessionExtensionsToday") or 0) >= MAX_DAILY_EXTENSIONS and q_now["used_today"] == 0:
                 log(
@@ -1113,20 +1234,88 @@ def run_server(cfg, server_id, account=""):
                     "该计数已过期，按 0 处理"
                 )
 
-            # 仅「到期之后」才执行续期；未到期则跳过（不报错）
-            if only_power_on or (
-                before.get("sessionExpiresAt")
+            # 仅「到期之后」才执行续期。
+            # 例外：预检时已到期（pre_was_expired）→ 开机后新会话允许续期。
+            # only_power_on：预检未到期但关机 → 只开机不续期。
+            if only_power_on:
+                log(
+                    "仅执行开机（预检时会话未到期）。"
+                    f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
+                )
+                shot = take_screenshot(page, "skip_screenshot.png")
+                try:
+                    notify_godlike(
+                        cfg,
+                        account,
+                        short_id,
+                        "⏭️跳过续期（仅开机，尚未到期）",
+                        seconds_until(before.get("sessionExpiresAt")),
+                        before.get("status"),
+                        photo=shot,
+                        remaining_text=fmt_quota(quota(before))
+                        + "\n📅下次续期: "
+                        + fmt_next_renewal(before.get("sessionExpiresAt")),
+                    )
+                except Exception as e:
+                    log(f"跳过通知发送失败（不影响结果）: {e}")
+                return None
+
+            if (
+                not pre_was_expired
+                and before.get("sessionExpiresAt")
                 and not is_expired(before.get("sessionExpiresAt"))
             ):
                 log(
                     "会话尚未到期，不执行续期。"
                     f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
                 )
+                shot = take_screenshot(page, "skip_screenshot.png")
+                try:
+                    notify_godlike(
+                        cfg,
+                        account,
+                        short_id,
+                        "⏭️跳过（尚未到期）",
+                        seconds_until(before.get("sessionExpiresAt")),
+                        before.get("status"),
+                        photo=shot,
+                        remaining_text=fmt_quota(quota(before))
+                        + "\n📅下次续期: "
+                        + fmt_next_renewal(before.get("sessionExpiresAt")),
+                    )
+                except Exception as e:
+                    log(f"跳过通知发送失败（不影响结果）: {e}")
+                return None
+
+            # 预检已到期且开机后次数仍为 0：无法续期，跳过并通知
+            q_chk = quota(before)
+            if q_chk["remaining"] <= 0:
+                log(
+                    f"可续期次数仍为 0（今日 {q_chk['used_today']}/{MAX_DAILY_EXTENSIONS}"
+                    f" · 会话 {q_chk['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
+                )
+                shot = take_screenshot(page, "skip_screenshot.png")
+                try:
+                    notify_godlike(
+                        cfg,
+                        account,
+                        short_id,
+                        "⏭️跳过（无可用次数）",
+                        seconds_until(before.get("sessionExpiresAt")),
+                        before.get("status"),
+                        photo=shot,
+                        remaining_text=fmt_quota(q_chk)
+                        + "\n📅下次续期: "
+                        + fmt_next_renewal(before.get("sessionExpiresAt")),
+                    )
+                except Exception as e:
+                    log(f"跳过通知发送失败（不影响结果）: {e}")
                 return None
 
             log(
-                "会话已到期，开始续期。"
-                f"到期时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
+                "开始续期。"
+                f"到期时间: {fmt_next_renewal(before.get('sessionExpiresAt'))} | "
+                f"{fmt_quota(quota(before))}"
             )
 
             # ===== 单次运行内连续续期：每轮 = 点延伸 + 看 3 个广告 + 验证 +4h =====
