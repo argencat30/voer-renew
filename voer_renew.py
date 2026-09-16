@@ -20,7 +20,7 @@ VPS / CI 无图形界面时必须用虚拟显示：
     xvfb-run -a python3 voer_renew.py
 
 用法：
-    python3 voer_renew.py            自动续期（关机则先重启，再按可续期次数连续续满）
+    python3 voer_renew.py            检查次数/到期时间；关机则开机；仅到期后续期
     python3 voer_renew.py --status   只看当前状态，不看广告
 """
 import json
@@ -225,8 +225,8 @@ def fmt_duration(seconds) -> str:
     return f"{h}h {m:02d}m"
 
 
-def seconds_until(iso_str) -> int | None:
-    """距离某个 ISO 时间还有多少秒（已过期返回 0，解析失败返回 None）。"""
+def parse_iso(iso_str):
+    """解析 ISO 时间为带时区的 datetime；失败返回 None。"""
     if not iso_str:
         return None
     try:
@@ -234,9 +234,44 @@ def seconds_until(iso_str) -> int | None:
         dt = datetime.fromisoformat(t)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
+        return dt
     except Exception:
         return None
+
+
+def seconds_until(iso_str) -> int | None:
+    """距离某个 ISO 时间还有多少秒（已过期返回 0，解析失败返回 None）。"""
+    dt = parse_iso(iso_str)
+    if dt is None:
+        return None
+    return max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
+
+
+def is_expired(iso_str) -> bool:
+    """会话是否已到期。无法解析时视为未到期（避免误续期）。"""
+    dt = parse_iso(iso_str)
+    if dt is None:
+        return False
+    return dt <= datetime.now(timezone.utc)
+
+
+def fmt_next_renewal(iso_str) -> str:
+    """下次续期准确时间：绝对时间（UTC + 本地）+ 剩余时长。"""
+    dt = parse_iso(iso_str)
+    if dt is None:
+        return "—"
+    now = datetime.now(timezone.utc)
+    sec = max(0, int((dt - now).total_seconds()))
+    utc_s = dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    # 本地时区：优先 Asia/Shanghai 展示，失败则用系统本地
+    try:
+        from zoneinfo import ZoneInfo
+        local_s = dt.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S CST")
+    except Exception:
+        local_s = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    if sec <= 0:
+        return f"{utc_s} / {local_s}（已到期，可立即续期）"
+    return f"{utc_s} / {local_s}（剩余 {fmt_duration(sec)}）"
 
 
 def status_text(status) -> str:
@@ -600,11 +635,12 @@ def ads_required_error(code, data) -> bool:
 
 
 def ensure_running(cfg, server_id: str, page=None):
-    """关机/离线/崩溃时先重启，就绪后再让调用方进入续期。
+    """仅检查是否关机：若为 stopped/offline 则开机或重启。
 
-    返回 (server, did_restart)。
+    其他状态（running / starting / crashed 等）一律不处理。
+    返回 (server, did_power_on)。开机失败只记日志，不抛异常。
     """
-    skip = str(os.environ.get("VOER_SKIP_RESTART", "")).strip() in ("1", "true", "yes")
+    skip = str(os.environ.get("VOER_SKIP_RESTART", "")).strip().lower() in ("1", "true", "yes")
     if skip or not cfg.get("restart_if_stopped", True):
         return api_state(cfg, server_id), False
 
@@ -612,33 +648,22 @@ def ensure_running(cfg, server_id: str, page=None):
     st = server_status_key(server)
     log(f"开机状态: {st or '未知'} — {status_text(st)}")
 
-    if is_running(server):
-        log("服务器已在运行中，无需重启")
-        return server, False
-
-    if is_starting(server):
-        log("服务器启动/重启中，等待就绪后再进入续期…")
-        server = wait_for_status(cfg, server_id, RUNNING_STATUSES, timeout=360) or server
+    # 只处理明确关机/离线
+    if not is_stopped(server):
         if is_running(server):
-            log("服务器已就绪")
-            return server, True
-        st = server_status_key(server)
-
-    if st in STOPPING_STATUSES:
-        log("服务器正在关机，等待停稳后再重启…")
-        wait_for_status(cfg, server_id, STOPPED_STATUSES | CRASHED_STATUSES, timeout=120)
-        server = api_state(cfg, server_id)
-        st = server_status_key(server)
-
-    if not (is_stopped(server) or is_crashed(server) or not is_running(server)):
+            log("服务器已在运行中，无需开机")
+        elif is_starting(server):
+            log("服务器启动中，等待就绪…")
+            server = wait_for_status(cfg, server_id, RUNNING_STATUSES, timeout=360) or server
+        else:
+            log(f"当前状态非关机（{st or '未知'}），跳过开机/重启")
         return server, False
 
-    log("检测到关机/离线，按流程：先重启，重启完成后再进入续期")
-    actions = ["restart"] if is_crashed(server) else ["start", "restart"]
+    log("检测到关机/离线：执行开机或重启")
     accepted = False
     need_ads = False
-    for act in actions:
-        log(f"关机后先重启：发送 {act}")
+    for act in ("start", "restart"):
+        log(f"发送电源指令: {act}")
         extra = {"adsCompleted": 0} if act == "start" else {}
         code, data = api_power(cfg, server_id, act, extra)
         if code in (200, 201, 202, 204):
@@ -654,27 +679,30 @@ def ensure_running(cfg, server_id: str, page=None):
 
     if need_ads or not accepted:
         if page is not None:
-            restart_via_panel(cfg, page, reason="关机后重启")
+            restart_via_panel(cfg, page, reason="关机后开机")
         elif need_ads:
-            log("开机需要看广告，但当前没有浏览器会话，无法完成重启")
+            log("开机需要看广告，但当前没有浏览器会话，无法完成开机")
             return server, False
 
     server = wait_for_status(cfg, server_id, RUNNING_STATUSES, timeout=360) or api_state(
         cfg, server_id
     )
-    if not is_running(server):
-        if page is not None and not need_ads:
-            log("API 重启后仍未运行，尝试面板开机")
-            restart_via_panel(cfg, page, reason="关机后重启（面板兜底）")
-            server = wait_for_status(
-                cfg, server_id, RUNNING_STATUSES, timeout=240
-            ) or api_state(cfg, server_id)
-    if not is_running(server):
-        raise RuntimeError(
-            f"重启后服务器仍未运行，当前状态: {server_status_key(server) or '未知'}"
-        )
-    log("重启完成，服务器已在运行")
-    return server, True
+    if not is_running(server) and page is not None and not need_ads:
+        log("API 开机后仍未运行，尝试面板开机")
+        restart_via_panel(cfg, page, reason="关机后开机（面板兜底）")
+        server = wait_for_status(
+            cfg, server_id, RUNNING_STATUSES, timeout=240
+        ) or api_state(cfg, server_id)
+
+    if is_running(server):
+        log("开机完成，服务器已在运行")
+        return server, True
+
+    log(
+        f"开机后服务器仍未运行（当前状态: {server_status_key(server) or '未知'}），"
+        "不报错，继续后续流程"
+    )
+    return server, False
 
 
 def load_config():
@@ -888,7 +916,7 @@ def dump_page_debug(page, tag="debug"):
 
 
 def run_server(cfg, server_id, account=""):
-    """对单台服务器执行一次完整续期流程。返回 True=成功，False/抛异常=失败。"""
+    """对单台服务器执行一次完整续期流程。返回 True=成功，False/抛异常=失败，None=跳过。"""
     url = f"https://voer.host/panel/server/{server_id}"
     short_id = server_id[:8] + "…"
 
@@ -909,6 +937,7 @@ def run_server(cfg, server_id, account=""):
         print(f"本会话已续期 = {q['session_ext']} / {MAX_SESSION_EXTENSIONS}")
         print(fmt_quota(q))
         print(f"开机状态 = {s.get('status')} ({status_text(s.get('status'))})")
+        print(f"下次续期准确时间 = {fmt_next_renewal(s.get('sessionExpiresAt'))}")
         # status 也可发一条简短通知（可选）
         if os.environ.get("TG_NOTIFY_STATUS") == "1":
             notify(
@@ -918,12 +947,46 @@ def run_server(cfg, server_id, account=""):
                     f"服务器: <code>{short_id}</code>",
                     f"状态: {s.get('status')}",
                     f"到期: {s.get('sessionExpiresAt')}",
+                    f"下次续期: {fmt_next_renewal(s.get('sessionExpiresAt'))}",
                     f"累计续期: {s.get('sessionExtensions')}",
                     f"今日续期: {today_used(s)} / {MAX_DAILY_EXTENSIONS} (UTC)",
                     f"{fmt_quota(q)}",
                 ],
             )
         return True
+
+    # ===== 浏览器启动前：轻量检查，无次数 / 未到期则跳过（不报错）=====
+    try:
+        pre = api_state(cfg, server_id)
+    except SystemExit:
+        raise
+    except Exception as e:
+        log(f"预检 API 失败: {e}，将继续尝试完整流程")
+        pre = {}
+
+    if pre:
+        q_pre = quota(pre)
+        log_quota(pre, prefix="预检")
+        log(f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}")
+        log(f"开机状态: {pre.get('status')} — {status_text(pre.get('status'))}")
+
+        if q_pre["remaining"] <= 0:
+            log(
+                f"可续期次数为 0（今日 {q_pre['used_today']}/{MAX_DAILY_EXTENSIONS}"
+                f" · 会话 {q_pre['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
+            )
+            return None
+
+        # 未到期：只记录准确时间，不执行续期
+        if pre.get("sessionExpiresAt") and not is_expired(pre.get("sessionExpiresAt")):
+            # 若已关机仍需开机，继续往下；否则跳过续期
+            if not is_stopped(pre):
+                log(
+                    "会话尚未到期，跳过续期（不报错）。"
+                    f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}"
+                )
+                return None
+            log("会话尚未到期，但服务器已关机，将仅执行开机（不续期）")
 
     success = False
     before = {}
@@ -934,6 +997,12 @@ def run_server(cfg, server_id, account=""):
     max_ext = max(1, int(cfg.get("extensions_per_run", 4)))
     rounds_ok = 0
     stop_reason = ""
+    only_power_on = bool(
+        pre
+        and pre.get("sessionExpiresAt")
+        and not is_expired(pre.get("sessionExpiresAt"))
+        and is_stopped(pre)
+    )
 
     watch_labels = [
         "觀看廣告",
@@ -1006,7 +1075,8 @@ def run_server(cfg, server_id, account=""):
                 f"(sessionExtensionsDate={before.get('sessionExtensionsDate')})",
             )
             log(f"开机状态: {before.get('status')} — {status_text(before.get('status'))}")
-            log_quota(before, prefix="重启前检查")
+            log(f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}")
+            log_quota(before, prefix="检查")
 
             for accept_txt in ("Accept", "Accept all", "同意", "接受", "I agree", "OK"):
                 hit = click_anywhere(page, [accept_txt], 3000)
@@ -1014,39 +1084,25 @@ def run_server(cfg, server_id, account=""):
                     log(f"已点同意弹窗: {hit}")
                     break
 
-            # 关机 / 离线 / 崩溃：先重启，重启完成后再进入续期
-            try:
-                before, did_restart = ensure_running(cfg, server_id, page=page)
-            except RuntimeError as e:
-                log(f"关机后重启失败: {e}")
-                notify(
-                    cfg,
-                    "❌ Voer 重启失败",
-                    [
-                        f"服务器: <code>{short_id}</code>",
-                        f"原因: {e}",
-                        "关机后未能重启，已中止续期",
-                    ],
-                    photo=pathlib.Path(_shot_name("debug_screenshot.png")),
-                )
-                return False
-            if did_restart:
+            # 只检查是否关机：关机则开机/重启（不抛错）
+            before, did_power = ensure_running(cfg, server_id, page=page)
+            if did_power:
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=60000)
                     page.wait_for_timeout(4000)
                 except Exception:
                     pass
-                log("重启之后检查可续期次数")
-                log_quota(before, prefix="重启后检查")
+                before = api_state(cfg, server_id)
+                log("开机之后再次检查可续期次数与到期时间")
+                log_quota(before, prefix="开机后检查")
+                log(f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}")
 
-            # 今日/本会话已达上限时面板会隐藏续期入口，直接跳过（不算失败）
-            # 返回 None 表示「跳过」，区别于 True=成功 / False=失败
+            # 可续期次数为 0 → 跳过，不报错
             q_now = quota(before)
             if q_now["remaining"] <= 0:
                 log(
                     f"可续期次数为 0（今日 {q_now['used_today']}/{MAX_DAILY_EXTENSIONS}"
-                    f" · 会话 {q_now['session_ext']}/{MAX_SESSION_EXTENSIONS}），"
-                    "平台已隐藏续期入口，跳过该服务器"
+                    f" · 会话 {q_now['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
                 )
                 return None
             if int(before.get("sessionExtensionsToday") or 0) >= MAX_DAILY_EXTENSIONS and q_now["used_today"] == 0:
@@ -1054,8 +1110,24 @@ def run_server(cfg, server_id, account=""):
                     "注意：sessionExtensionsToday="
                     f"{before.get('sessionExtensionsToday')} 但 sessionExtensionsDate="
                     f"{before.get('sessionExtensionsDate')} 不是今天（UTC），"
-                    "该计数已过期，按 0 处理，继续尝试续期"
+                    "该计数已过期，按 0 处理"
                 )
+
+            # 仅「到期之后」才执行续期；未到期则跳过（不报错）
+            if only_power_on or (
+                before.get("sessionExpiresAt")
+                and not is_expired(before.get("sessionExpiresAt"))
+            ):
+                log(
+                    "会话尚未到期，不执行续期。"
+                    f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
+                )
+                return None
+
+            log(
+                "会话已到期，开始续期。"
+                f"到期时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
+            )
 
             # ===== 单次运行内连续续期：每轮 = 点延伸 + 看 3 个广告 + 验证 +4h =====
             for round_no in range(1, max_ext + 1):
@@ -1219,6 +1291,8 @@ def run_server(cfg, server_id, account=""):
             cand = pathlib.Path(_shot_name("renew_screenshot.png"))
             photo = cand if cand.exists() else None
         remaining_text = fmt_quota(quota(final_state))
+        next_text = fmt_next_renewal(final_state.get("sessionExpiresAt"))
+        log(f"下次续期准确时间: {next_text}")
         notify_godlike(
             cfg,
             account,
@@ -1227,7 +1301,7 @@ def run_server(cfg, server_id, account=""):
             uptime,
             final_state.get("status"),
             photo=photo,
-            remaining_text=remaining_text,
+            remaining_text=remaining_text + "\n📅下次续期: " + next_text,
         )
         return True
     else:
@@ -1297,7 +1371,7 @@ def main():
         if ok is True:
             mark = "✅ 成功"
         elif ok is None:
-            mark = "⏭️ 跳过（今日已满 4 次，UTC 当日）"
+            mark = "⏭️ 跳过（无可用次数 / 尚未到期）"
         else:
             mark = "❌ 失败"
         if ok is False:
