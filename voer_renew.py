@@ -866,12 +866,96 @@ def _is_panel_frame(url: str) -> bool:
     return "voer.host" in u and not _is_ad_frame(u)
 
 
+# Google 激励广告中间页（截图里的 Unlock more content）
+SURVEY_AD_LABELS = [
+    "View a short ad",
+    "View a short Ad",
+    "View short ad",
+    "Watch a short ad",
+    "Watch short ad",
+    "Site-wide access for 24 hours",
+    "Site-wide access",
+    "Unlock more content",
+    "Continue",
+    "继续",
+    "繼續",
+]
+
+
+def click_survey_gate(page) -> str | None:
+    """处理「Unlock more content / View a short ad」中间页。
+
+    续期时经常出现：点了 Watch ad 后先出这个调查/许可页，
+    必须点「View a short ad」才会真正播视频并出现 #dismiss-button。
+    可在任意 frame（含面板弹层）点击。
+    """
+    labels = SURVEY_AD_LABELS
+    for frame in page.frames:
+        for t in labels:
+            makers = [
+                lambda t=t, f=frame: f.get_by_role("button", name=t, exact=False).first,
+                lambda t=t, f=frame: f.get_by_text(t, exact=False).first,
+                lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
+                lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
+                lambda t=t, f=frame: f.locator(f"label:has-text('{t}')").first,
+                lambda t=t, f=frame: f.locator(f"div:has-text('{t}')").first,
+            ]
+            for maker in makers:
+                try:
+                    loc = maker()
+                    if not (loc.count() and loc.is_visible()):
+                        continue
+                    # 避免点到整块大容器：优先小一点的可点击元素
+                    try:
+                        box = loc.bounding_box()
+                        if box and box.get("height", 0) > 200 and t not in (
+                            "View a short ad",
+                            "Watch a short ad",
+                        ):
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        loc.scroll_into_view_if_needed(timeout=1500)
+                    except Exception:
+                        pass
+                    try:
+                        loc.click(timeout=2500)
+                    except Exception:
+                        loc.click(timeout=2500, force=True)
+                    return f"{t}@{frame.url[:70]}"
+                except Exception:
+                    pass
+        # 单选圆点 + 文案（截图里的 radio）
+        try:
+            radio = frame.locator(
+                "input[type='radio'], [role='radio'], .UPeD0c, [class*='radio' i]"
+            ).first
+            if radio.count() and radio.is_visible():
+                radio.click(timeout=2000, force=True)
+                page.wait_for_timeout(500)
+                # 再点确认类按钮
+                for t in ("Continue", "继续", "OK", "View a short ad"):
+                    try:
+                        b = frame.get_by_role("button", name=t, exact=False).first
+                        if b.count() and b.is_visible():
+                            b.click(timeout=2000)
+                            return f"radio+{t}@{frame.url[:60]}"
+                    except Exception:
+                        pass
+                return f"radio@{frame.url[:60]}"
+        except Exception:
+            pass
+    return None
+
+
 def click_close_ad(page, timeout_ms=60000):
     """关闭激励广告播放器。
 
-    关键：必须优先在 googleads / wormies 等广告 iframe 里点 Close。
-    绝不能点面板主页面「Watch Ads to Extend」弹窗右上角的 X —— 那会直接关掉整个续期弹窗，
-    进度仍停在 0/3，续期不会生效。
+    关键：
+    1. 若出现「View a short ad / Unlock more content」中间页，先点掉
+    2. 再在 googleads iframe 里点 #dismiss-button / Close
+    3. 绝不能点面板主页面续期弹窗右上角的 X
     """
     close_labels = [
         "Close",
@@ -888,12 +972,12 @@ def click_close_ad(page, timeout_ms=60000):
         "完成",
     ]
     css_selectors = [
+        "#dismiss-button",
         "button[aria-label*='lose' i]",
         "button[aria-label*='Close' i]",
         "button[aria-label*='kip' i]",
         "button[aria-label*='关闭']",
         "button[aria-label*='關閉']",
-        "#dismiss-button",
         ".videoAdUiSkipButton",
         ".ytp-ad-skip-button",
         "button[class*='skip' i]",
@@ -903,15 +987,21 @@ def click_close_ad(page, timeout_ms=60000):
 
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
+        # 0) 中间页：View a short ad（可能多次出现）
+        gate = click_survey_gate(page)
+        if gate:
+            log(f"已点击广告中间页: {gate}")
+            page.wait_for_timeout(2500)
+            # 点完中间页后视频才开始，需要再等一会儿才能出现 dismiss
+            continue
+
         frames = list(page.frames)
-        # 1) 优先广告 iframe
         ordered = sorted(
             frames,
             key=lambda f: (0 if _is_ad_frame(f.url) else 1 if not _is_panel_frame(f.url) else 2),
         )
         for frame in ordered:
             if _is_panel_frame(frame.url):
-                # 面板主页面：跳过，避免点到弹窗 X
                 continue
             for t in close_labels:
                 makers = [
@@ -937,7 +1027,6 @@ def click_close_ad(page, timeout_ms=60000):
                     pass
         time.sleep(1.0)
 
-    # 2) 最后手段：仍不在面板上点 X；只在广告帧再试一次宽松匹配
     for frame in page.frames:
         if not _is_ad_frame(frame.url):
             continue
@@ -1163,25 +1252,51 @@ def watch_ads_round(page, cfg, total, watch_labels=None):
             player_ok = wait_for_ad_player(page, timeout_ms=20000)
 
         if not player_ok:
-            log(f"第 {i} 条广告播放器仍未出现，本条不计为有效")
-            try:
-                dump_page_debug(page, f"no_ad_player_{i}")
-            except Exception:
-                pass
-            # 不 break，给下一条机会；但若连续失败可停止
-            page.wait_for_timeout(3000)
-            continue
+            # 可能是中间页挡住了：先点 View a short ad
+            gate = click_survey_gate(page)
+            if gate:
+                log(f"播放器未出，先点中间页: {gate}")
+                page.wait_for_timeout(3000)
+                player_ok = wait_for_ad_player(page, timeout_ms=20000)
+            if not player_ok:
+                log(f"第 {i} 条广告播放器仍未出现，本条不计为有效")
+                try:
+                    dump_page_debug(page, f"no_ad_player_{i}")
+                except Exception:
+                    pass
+                page.wait_for_timeout(3000)
+                continue
 
-        log(f"广告播放中，等待 {duration_ms // 1000}s…")
-        page.wait_for_timeout(duration_ms)
+        # 播放等待期间轮询：中间页 / dismiss 按钮
+        log(f"广告播放中，等待最多 {duration_ms // 1000}s（期间处理中间页）…")
+        play_deadline = time.time() + duration_ms / 1000
+        closed = None
+        while time.time() < play_deadline:
+            gate = click_survey_gate(page)
+            if gate:
+                log(f"播放中点到中间页: {gate}，重新计时等待视频…")
+                # 点完中间页后视频才真正开始
+                play_deadline = time.time() + duration_ms / 1000
+                page.wait_for_timeout(2000)
+                continue
+            # 若 dismiss 提前出现，可以直接关
+            closed = click_close_ad(page, timeout_ms=1500)
+            if closed:
+                log(f"第 {i} 个广告提前可关闭（{closed}）")
+                break
+            page.wait_for_timeout(1000)
 
-        closed = click_close_ad(page, timeout_ms=50000)
+        if not closed:
+            closed = click_close_ad(page, timeout_ms=50000)
         if closed:
             log(f"第 {i} 个广告已关闭（{closed}）")
         else:
-            log("未找到广告帧 Close，再等 10s…")
-            page.wait_for_timeout(10000)
-            closed = click_close_ad(page, timeout_ms=15000)
+            log("未找到广告帧 Close，再试中间页 + 关闭…")
+            gate = click_survey_gate(page)
+            if gate:
+                log(f"补点中间页: {gate}")
+                page.wait_for_timeout(duration_ms)
+            closed = click_close_ad(page, timeout_ms=20000)
             if closed:
                 log(f"第 {i} 个广告延迟关闭成功（{closed}）")
             else:
@@ -1193,7 +1308,6 @@ def watch_ads_round(page, cfg, total, watch_labels=None):
                 page.wait_for_timeout(3000)
                 continue
 
-        # 只有成功关闭广告帧才计数
         watched += 1
         log(f"有效广告进度: {watched}/{total}")
         page.wait_for_timeout(6000)
