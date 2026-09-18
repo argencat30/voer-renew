@@ -10,7 +10,9 @@ Voer.host 免费服务器会话续期（Playwright 版）
 
 优先读取环境变量（适合 GitHub Actions / Docker / cron）：
     VOER_SERVER_ID        服务器 UUID（必须）
-    VOER_TOKEN            Cookie 里的 token JWT（必须）
+    VOER_TOKEN            Cookie 里的 token JWT（优先；过期则自动邮箱登录刷新）
+    VOER_EMAIL            登录邮箱（token 过期时使用）
+    VOER_PASSWORD         登录密码（token 过期时使用）
     TELEGRAM_BOT_TOKEN    Telegram Bot Token（可选，用于通知）
     TELEGRAM_CHAT_ID      Telegram Chat ID（可选，用于通知）
 
@@ -46,6 +48,8 @@ UA = (
 DEFAULT_CONFIG = {
     "server_id": "在这里填服务器 UUID（面板地址 /panel/server/ 后面那串）",
     "token": "在这里填浏览器 Cookie 里 voer.host 的 token 值（JWT）",
+    "email": "",          # 可选；token 过期时用邮箱+密码登录并自动刷新 token
+    "password": "",       # 可选；对应 VOER_PASSWORD
     "ads_per_extension": 3,
     "ad_duration_sec": 32,
     "extensions_per_run": 4,   # 单次运行内最多连续续期几次（受平台每日/每会话 4 次上限约束）
@@ -381,6 +385,389 @@ def _jwt_hint(token: str) -> str:
     except Exception:
         pass
     return hint
+
+
+
+def _jwt_exp(token: str):
+    """解析 JWT exp（UTC datetime）；失败返回 None。"""
+    t = (token or "").strip()
+    parts = t.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        pad = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(pad))
+        exp = payload.get("exp")
+        if exp is None:
+            return None
+        return datetime.fromtimestamp(int(exp), tz=timezone.utc)
+    except Exception:
+        return None
+
+
+def token_looks_valid(token: str, skew_sec: int = 120) -> bool:
+    """仅根据 JWT 形态与 exp 判断是否仍可用（不发起网络请求）。"""
+    t = (token or "").strip()
+    if not t or "在这里填" in t or len(t) < 20:
+        return False
+    if t.count(".") != 2 or not t.startswith("eyJ"):
+        return False
+    exp = _jwt_exp(t)
+    if exp is None:
+        # 解不出 exp 时仍尝试使用（由 API 再验证）
+        return True
+    return exp > datetime.now(timezone.utc) + timedelta(seconds=skew_sec)
+
+
+def probe_token(cfg) -> bool:
+    """用 /api/auth/me 探测 token 是否真正可用。"""
+    token = (cfg.get("token") or "").strip()
+    if not token_looks_valid(token):
+        return False
+    url = "https://voer.host/api/auth/me"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Cookie": f"token={token}",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": UA,
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            if r.status != 200:
+                return False
+            raw = r.read().decode(errors="replace")
+            data = json.loads(raw) if raw.strip() else {}
+            return bool(data.get("user") or data.get("email") or data.get("id") or data)
+    except urllib.error.HTTPError as e:
+        log(f"token 探测失败: HTTP {e.code}")
+        return False
+    except Exception as e:
+        log(f"token 探测异常: {e}")
+        return False
+
+
+def persist_token(cfg, new_token: str) -> None:
+    """把新 token 写回内存 / config.json / GITHUB_ENV（无法改 GitHub Secrets）。"""
+    new_token = (new_token or "").strip()
+    if not new_token:
+        return
+    cfg["token"] = new_token
+    os.environ["VOER_TOKEN"] = new_token
+    log(f"已更新内存中的 VOER_TOKEN: {_jwt_hint(new_token)}")
+
+    # 本地 config.json
+    try:
+        if CONFIG_PATH.exists():
+            try:
+                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data["token"] = new_token
+            CONFIG_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=4) + "\n",
+                encoding="utf-8",
+            )
+            log(f"已写入 {CONFIG_PATH.name} 的 token 字段")
+    except Exception as e:
+        log(f"写入 config.json 失败（不影响续期）: {e}")
+
+    # GitHub Actions：写入 GITHUB_ENV，供同 job 后续步骤使用
+    gh_env = os.environ.get("GITHUB_ENV", "").strip()
+    if gh_env:
+        try:
+            with open(gh_env, "a", encoding="utf-8") as f:
+                f.write(f"VOER_TOKEN={new_token}\n")
+            log("已写入 GITHUB_ENV（同 job 后续步骤可读取新 token）")
+        except Exception as e:
+            log(f"写入 GITHUB_ENV 失败（不影响续期）: {e}")
+
+
+def _sb_challenge_visible(sb) -> bool:
+    try:
+        src = sb.get_page_source() or ""
+        low = src.lower()
+        return (
+            "verify you are human" in low
+            or "security verification" in low
+            or "cf-turnstile" in low
+            or "challenge-platform" in low
+            or "turnstile" in low and "cloudflare" in low
+        )
+    except Exception:
+        return False
+
+
+def _sb_handle_turnstile(sb, max_retry: int = 4) -> bool:
+    """参考 SkyMC：SeleniumBase UC 点击 Cloudflare Turnstile。"""
+    if not _sb_challenge_visible(sb):
+        # 即使不可见也尝试一次（有时 widget 已渲染）
+        try:
+            sb.uc_gui_click_captcha()
+            time.sleep(3)
+        except Exception:
+            pass
+        return True
+    log("检测到 Cloudflare Turnstile，开始绕过…")
+    for i in range(max_retry):
+        log(f"  Turnstile 第 {i + 1}/{max_retry} 次尝试")
+        try:
+            sb.uc_gui_click_captcha()
+            log("  已调用 uc_gui_click_captcha")
+            time.sleep(5)
+            if not _sb_challenge_visible(sb):
+                log("  Turnstile 已通过")
+                return True
+        except Exception as e:
+            log(f"  uc_gui_click_captcha 异常: {e}")
+        time.sleep(2)
+    log("  Turnstile 可能未完全通过，继续尝试登录")
+    return False
+
+
+def login_with_password(cfg) -> str | None:
+    """邮箱+密码登录 voer.host，绕过 Turnstile，返回新 token；失败返回 None。
+
+    使用 SeleniumBase UC 模式（与 SkyMC 脚本同一套思路）。
+    """
+    email = (cfg.get("email") or "").strip()
+    password = (cfg.get("password") or "").strip()
+    if not email or not password:
+        log("未配置 VOER_EMAIL / VOER_PASSWORD，无法邮箱登录")
+        return None
+
+    try:
+        from seleniumbase import SB
+    except ImportError:
+        log("未安装 seleniumbase，无法邮箱登录。请 pip install seleniumbase")
+        return None
+
+    log(f"使用邮箱密码登录: {email}")
+    headless = bool(cfg.get("headless", False))
+    # UC 模式在无头环境需配合 xvfb；与续期一致默认非 headless
+    sb_kwargs = {"uc": True, "headless": headless, "locale_code": "en"}
+    new_token = None
+
+    try:
+        with SB(**sb_kwargs) as sb:
+            try:
+                sb.uc_open_with_reconnect("https://voer.host/login", reconnect_time=6)
+            except Exception:
+                sb.open("https://voer.host/login")
+            try:
+                sb.wait_for_ready_state_complete()
+            except Exception:
+                pass
+            time.sleep(3)
+            _sb_handle_turnstile(sb)
+            time.sleep(1)
+
+            # 填写邮箱
+            filled_email = False
+            for sel in (
+                "#login-email",
+                'input[name="email"]',
+                'input[type="email"]',
+                'input[autocomplete="email"]',
+            ):
+                try:
+                    sb.wait_for_element_visible(sel, timeout=8)
+                    sb.clear(sel)
+                    sb.type(sel, email)
+                    filled_email = True
+                    log(f"已填写邮箱（{sel}）")
+                    break
+                except Exception:
+                    continue
+            if not filled_email:
+                try:
+                    sb.execute_script(
+                        """
+                        var v = arguments[0];
+                        var sels = ['#login-email','input[name="email"]','input[type="email"]'];
+                        for (var i=0;i<sels.length;i++){
+                          var el = document.querySelector(sels[i]);
+                          if(!el) continue;
+                          el.focus(); el.value=v;
+                          el.dispatchEvent(new Event('input',{bubbles:true}));
+                          el.dispatchEvent(new Event('change',{bubbles:true}));
+                          return sels[i];
+                        }
+                        return null;
+                        """,
+                        email,
+                    )
+                    filled_email = True
+                    log("已通过 JS 填写邮箱")
+                except Exception as e:
+                    log(f"填写邮箱失败: {e}")
+            if not filled_email:
+                log("无法填写邮箱")
+                return None
+
+            time.sleep(0.5)
+
+            # 填写密码
+            filled_pw = False
+            for sel in (
+                "#login-password",
+                'input[name="password"]',
+                'input[type="password"]',
+            ):
+                try:
+                    sb.wait_for_element_visible(sel, timeout=8)
+                    sb.clear(sel)
+                    sb.type(sel, password)
+                    filled_pw = True
+                    log(f"已填写密码（{sel}）")
+                    break
+                except Exception:
+                    continue
+            if not filled_pw:
+                try:
+                    sb.execute_script(
+                        """
+                        var v = arguments[0];
+                        var sels = ['#login-password','input[name="password"]','input[type="password"]'];
+                        for (var i=0;i<sels.length;i++){
+                          var el = document.querySelector(sels[i]);
+                          if(!el) continue;
+                          el.focus(); el.value=v;
+                          el.dispatchEvent(new Event('input',{bubbles:true}));
+                          el.dispatchEvent(new Event('change',{bubbles:true}));
+                          return sels[i];
+                        }
+                        return null;
+                        """,
+                        password,
+                    )
+                    filled_pw = True
+                    log("已通过 JS 填写密码")
+                except Exception as e:
+                    log(f"填写密码失败: {e}")
+            if not filled_pw:
+                log("无法填写密码")
+                return None
+
+            time.sleep(1)
+            _sb_handle_turnstile(sb)
+            time.sleep(2)
+
+            # 点击登录
+            clicked = False
+            for sel in (
+                'button:contains("Sign in")',
+                'button:contains("Login")',
+                'button:contains("登录")',
+                'button[type="submit"]',
+            ):
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.uc_click(sel)
+                        log(f"已点击登录（{sel}）")
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                try:
+                    sb.execute_script(
+                        """
+                        var btns = document.querySelectorAll('button');
+                        for (var i=0;i<btns.length;i++){
+                          var t=(btns[i].innerText||'').toLowerCase();
+                          if(t.indexOf('sign in')>=0 || t.indexOf('login')>=0 || t.indexOf('登录')>=0){
+                            btns[i].click(); return true;
+                          }
+                        }
+                        var s=document.querySelector('button[type="submit"]');
+                        if(s){ s.click(); return true; }
+                        return false;
+                        """
+                    )
+                    clicked = True
+                    log("已通过 JS 点击登录")
+                except Exception as e:
+                    log(f"点击登录失败: {e}")
+                    return None
+
+            # 等待跳转 / 处理二次验证
+            for attempt in range(12):
+                time.sleep(2)
+                if _sb_challenge_visible(sb):
+                    log("登录后仍见 Turnstile，再次处理…")
+                    _sb_handle_turnstile(sb, max_retry=3)
+                url = (sb.get_current_url() or "").lower()
+                # 读 cookie
+                try:
+                    cookies = sb.driver.get_cookies()
+                except Exception:
+                    cookies = []
+                for c in cookies:
+                    if c.get("name") == "token" and c.get("value"):
+                        new_token = c["value"].strip()
+                        break
+                if new_token and ("panel" in url or "login" not in url):
+                    log(f"登录成功，已取得 token（URL={sb.get_current_url()}）")
+                    break
+                if new_token and attempt >= 3:
+                    # 有 token 即使还在中间页也接受
+                    log("已取得 token cookie")
+                    break
+                if attempt == 5:
+                    # 再点一次登录
+                    try:
+                        sb.uc_click('button[type="submit"]')
+                    except Exception:
+                        pass
+            if not new_token:
+                log(f"登录后未拿到 token，当前 URL: {sb.get_current_url()}")
+                try:
+                    sb.save_screenshot("login_failed.png")
+                    log("已保存 login_failed.png")
+                except Exception:
+                    pass
+                return None
+    except Exception as e:
+        log(f"邮箱登录异常: {e}")
+        return None
+
+    return new_token
+
+
+def ensure_token(cfg) -> bool:
+    """优先 VOER_TOKEN；无效则邮箱密码登录并自动更新 token。"""
+    token = (cfg.get("token") or "").strip()
+    if token and "在这里填" not in token and probe_token(cfg):
+        log(f"VOER_TOKEN 有效: {_jwt_hint(token)}")
+        return True
+
+    if token and token_looks_valid(token):
+        log("JWT 未过期但 API 探测未通过，尝试继续使用；若后续 401 会再登录")
+        # 仍先尝试邮箱刷新（更稳）
+    else:
+        log("VOER_TOKEN 缺失或已过期")
+
+    email = (cfg.get("email") or "").strip()
+    password = (cfg.get("password") or "").strip()
+    if not email or not password:
+        log("无可用 token，且未配置 VOER_EMAIL / VOER_PASSWORD")
+        return False
+
+    log("尝试邮箱密码登录以刷新 VOER_TOKEN…")
+    new_token = login_with_password(cfg)
+    if not new_token:
+        return False
+    persist_token(cfg, new_token)
+    if probe_token(cfg):
+        log("新 token 探测通过")
+        return True
+    log("新 token 已写入，但 /api/auth/me 探测未通过（仍将尝试续期）")
+    return True
 
 
 def today_used(server: dict) -> int:
@@ -773,10 +1160,22 @@ def load_config():
 
     env_sid = os.environ.get("VOER_SERVER_ID", "").strip().strip('"').strip("'")
     env_token = os.environ.get("VOER_TOKEN", "").strip().strip('"').strip("'")
+    env_email = (
+        os.environ.get("VOER_EMAIL", "").strip().strip('"').strip("'")
+        or os.environ.get("EMAIL", "").strip().strip('"').strip("'")
+    )
+    env_password = (
+        os.environ.get("VOER_PASSWORD", "").strip().strip('"').strip("'")
+        or os.environ.get("PASSWORD", "").strip().strip('"').strip("'")
+    )
     if env_sid:
         cfg["server_id"] = env_sid
     if env_token:
         cfg["token"] = env_token
+    if env_email:
+        cfg["email"] = env_email
+    if env_password:
+        cfg["password"] = env_password
 
     # Telegram（环境变量优先）
     env_tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
@@ -801,9 +1200,18 @@ def load_config():
 
     sid = cfg.get("server_id", "")
     token = cfg.get("token", "")
-    if not sid or "在这里填" in sid or not token or "在这里填" in token:
+    email = (cfg.get("email") or "").strip()
+    password = (cfg.get("password") or "").strip()
+    token_ok = token and "在这里填" not in token
+    creds_ok = bool(email and password)
+    if not sid or "在这里填" in sid:
         log("=" * 60)
-        log("缺少必要配置！请设置 VOER_SERVER_ID 和 VOER_TOKEN")
+        log("缺少必要配置！请设置 VOER_SERVER_ID")
+        log("=" * 60)
+        sys.exit(1)
+    if not token_ok and not creds_ok:
+        log("=" * 60)
+        log("缺少认证配置！请设置 VOER_TOKEN，或同时设置 VOER_EMAIL + VOER_PASSWORD")
         log("可选：TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID 用于通知")
         log("=" * 60)
         sys.exit(1)
@@ -875,8 +1283,23 @@ def api_state(cfg, server_id=None):
             log(f"响应内容: {body}")
         if e.code in (401, 403):
             log("")
-            log("【401/403】token 过期或错误，请重新从浏览器复制 VOER_TOKEN")
-            log(f"当前 token 诊断: {_jwt_hint(cfg['token'])}")
+            log("【401/403】token 过期或错误")
+            log(f"当前 token 诊断: {_jwt_hint(cfg.get('token', ''))}")
+            # 尝试邮箱密码重新登录一次（避免整次任务直接退出）
+            if not cfg.get("_relogin_attempted"):
+                cfg["_relogin_attempted"] = True
+                email = (cfg.get("email") or "").strip()
+                password = (cfg.get("password") or "").strip()
+                if email and password:
+                    log("尝试邮箱密码重新登录…")
+                    new_token = login_with_password(cfg)
+                    if new_token:
+                        persist_token(cfg, new_token)
+                        log("重新登录成功，重试 API…")
+                        return api_state(cfg, server_id)
+                log("请设置有效的 VOER_TOKEN，或配置 VOER_EMAIL + VOER_PASSWORD")
+            else:
+                log("已尝试过重新登录仍失败")
         log("=" * 60)
         raise SystemExit(1) from e
     except urllib.error.URLError as e:
@@ -1590,6 +2013,11 @@ def run_server(cfg, server_id, account=""):
 def main():
     cfg = load_config()
     server_ids = cfg.get("server_ids") or [cfg["server_id"]]
+
+    # 优先 VOER_TOKEN；过期则邮箱密码登录并自动更新 token
+    if not ensure_token(cfg):
+        log("无法获得有效 VOER_TOKEN，退出")
+        sys.exit(1)
 
     # 取账号邮箱（用于通知；失败不影响续期）
     account = ""

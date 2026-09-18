@@ -1,6 +1,8 @@
 {
     "server_id": "在这里填服务器UUID（多台用英文逗号分隔：uuid1,uuid2）",
     "token": "在这里填Cookie中的token（JWT，同一账号所有服务器共用）",
+    "email": "可选：登录邮箱（token 过期时自动登录刷新）",
+    "password": "可选：登录密码",
     "ads_per_extension": 3,
     "ad_duration_sec": 32,
     "extensions_per_run": 4,
