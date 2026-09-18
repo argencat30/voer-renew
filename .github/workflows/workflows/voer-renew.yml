@@ -1,0 +1,203 @@
+# Voer.host 免费服务器自动续期
+# 每次运行会连续续期（每轮看 3 个激励广告 +4 小时），直到当日 4/4 或本会话 4/4 上限
+#
+# 使用前必须在仓库 Settings → Secrets and variables → Actions 里添加：
+#   VOER_SERVER_ID   = 服务器 UUID（支持多个！用英文逗号分隔即可，见下）
+#   VOER_TOKEN          = Cookie 中的 token（JWT，优先使用）
+#   VOER_EMAIL          = （可选）登录邮箱；token 过期时自动登录刷新 token
+#   VOER_PASSWORD       = （可选）登录密码
+#   TELEGRAM_BOT_TOKEN  = （可选）Telegram Bot Token，用于续期结果通知+截图
+#   TELEGRAM_CHAT_ID    = （可选）Telegram Chat ID
+#
+# 多服务器（同一账号）：
+#   VOER_SERVER_ID 填多台服务器 UUID，用英文逗号分隔，例如：
+#     58d72957-xxxx-xxxx-xxxx-xxxxxxxxxxxx,9a1b2c3d-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+#   token 是账号级的，同一账号所有服务器共用一个即可；脚本会逐台续期。
+#
+# 如何获取这两个值（非常重要）：
+# 1. 浏览器登录 https://voer.host
+# 2. 打开你的服务器面板，地址栏类似：
+#    https://voer.host/panel/server/58d72957-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+#    → 把最后一串 UUID 复制，就是 VOER_SERVER_ID（第二台服务器同样取一次，用逗号拼接）
+# 3. 按 F12 打开开发者工具 → Application（应用）标签
+#    → 左侧 Cookies → 点击 voer.host
+#    → 找到 name = token 那一行，复制 Value（以 eyJ 开头的长字符串）
+#    → 这就是 VOER_TOKEN（大约 7 天有效，过期后重新复制一次即可）
+#
+# 限制提醒（每台服务器独立计算）：
+# - 每 UTC 日每台最多续期 4 次
+# - 每个会话最多续期 4 次
+# - 每次成功 +4 小时
+# - 若服务器已关机/离线：先重启，重启完成后再检查可续期次数并进入续期
+# - 每轮续期成功后日志会实时打印剩余可续期次数
+# - 单次运行内会连续续期，直到当日 4/4 或本会话 4/4 为止（约 12～15 分钟）
+# - 想只续 1 次：把 VOER_EXTENSIONS_PER_RUN 设为 "1"
+# - 不想自动重启：把 VOER_SKIP_RESTART 设为 "1"
+# - headless 模式下广告不会发奖励，所以必须用 xvfb + headless=false
+
+name: Voer.host 会话续期
+
+on:
+  # 手动触发（Actions 页面点 Run workflow）
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式"
+        required: true
+        default: "renew"
+        type: choice
+        options:
+          - renew      # 真正续期（看广告）
+          - status     # 只查看当前状态，不消耗广告次数
+
+  # 定时任务（UTC 时间）
+  # 建议每天跑 2～3 次，避开高峰，且不超过每日 4 次上限
+  schedule:
+    - cron: "0 0,8,16 * * *"   # 每天 00:00 / 08:00 / 16:00 UTC
+    # 如果想改成更少次数，可改成：
+    # - cron: "0 2,14 * * *"   # 每天两次
+
+# 同一时间只允许一个任务跑，防止重复续期
+concurrency:
+  group: voer-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60          # 单台连续续满约 12～15 分钟；多台服务器按台数留足缓冲
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装系统依赖（虚拟显示 + 字体）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb fonts-liberation libnss3 libatk-bridge2.0-0 \
+            libgtk-3-0 libgbm1 libasound2t64 2>/dev/null || \
+          sudo apt-get install -y -qq xvfb fonts-liberation libnss3 libatk-bridge2.0-0 \
+            libgtk-3-0 libgbm1 libasound2
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 安装 Playwright Chromium
+        run: |
+          playwright install chromium --with-deps
+
+      - name: 检查 Secrets 是否已配置
+        env:
+          VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
+          VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASSWORD: ${{ secrets.VOER_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$VOER_SERVER_ID" ]; then
+            echo "❌ 缺少 VOER_SERVER_ID！"
+            exit 1
+          fi
+          if [ -z "$VOER_TOKEN" ] && { [ -z "$VOER_EMAIL" ] || [ -z "$VOER_PASSWORD" ]; }; then
+            echo "❌ 缺少认证 Secrets！"
+            echo "请至少配置 VOER_TOKEN，或同时配置 VOER_EMAIL + VOER_PASSWORD"
+            exit 1
+          fi
+          # 只打印长度和开头，不泄露完整 secret
+          echo "✅ 必要 Secrets 已配置"
+          echo "  VOER_SERVER_ID 长度=${#VOER_SERVER_ID}, 开头=${VOER_SERVER_ID:0:8}..."
+          if [ -n "$VOER_TOKEN" ]; then
+            echo "  VOER_TOKEN     长度=${#VOER_TOKEN}, 开头=${VOER_TOKEN:0:8}..."
+            DOTS=$(echo -n "$VOER_TOKEN" | tr -cd '.' | wc -c)
+            echo "  VOER_TOKEN 中 . 的数量=$DOTS（标准 JWT 应为 2）"
+            if [[ ! "$VOER_TOKEN" == eyJ* ]]; then
+              echo "⚠️  警告：正常 JWT 一般以 eyJ 开头，当前开头异常，可能复制错了"
+            fi
+            if [ "$DOTS" -ne 2 ]; then
+              echo "⚠️  警告：标准 JWT 应有 2 个点（3 段），当前点数=$DOTS，可能复制不完整"
+            fi
+          else
+            echo "  VOER_TOKEN     未设置（将使用邮箱密码登录）"
+          fi
+          if [ -n "$VOER_EMAIL" ]; then
+            echo "  VOER_EMAIL     已设置（token 过期时可自动登录刷新）"
+          else
+            echo "  VOER_EMAIL     未设置"
+          fi
+          # Telegram（可选）
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "ℹ️  Telegram 未完整配置（将跳过 TG 通知）"
+            echo "   需要同时存在这两个 Repository secrets（名称必须完全一致）："
+            echo "     TELEGRAM_BOT_TOKEN  长度=${#TELEGRAM_BOT_TOKEN}"
+            echo "     TELEGRAM_CHAT_ID    长度=${#TELEGRAM_CHAT_ID}"
+            echo "   Settings → Secrets and variables → Actions → New repository secret"
+          else
+            echo "✅ Telegram 已配置"
+            echo "  TELEGRAM_BOT_TOKEN 长度=${#TELEGRAM_BOT_TOKEN}, 开头=${TELEGRAM_BOT_TOKEN:0:6}..."
+            echo "  TELEGRAM_CHAT_ID   长度=${#TELEGRAM_CHAT_ID}, 值开头=${TELEGRAM_CHAT_ID:0:4}..."
+          fi
+
+      - name: 只查看状态（不消耗广告）
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'status'
+        env:
+          VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
+          VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASSWORD: ${{ secrets.VOER_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          xvfb-run -a python3 voer_renew.py --status
+
+      - name: 执行续期（看 3 个广告）
+        if: |
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'renew')
+        env:
+          VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
+          VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASSWORD: ${{ secrets.VOER_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 可选：覆盖默认值
+          # VOER_ADS_PER_EXTENSION: "3"
+          # VOER_AD_DURATION_SEC: "35"
+          # VOER_EXTENSIONS_PER_RUN: "4"   # 单次运行内连续续期几次（默认 4 = 续满当日上限）
+          # TG_TITLE: "Godlike 续期通知"    # 自定义 TG 通知标题
+        run: |
+          echo "开始续期，预计 3～5 分钟..."
+          xvfb-run -a python3 voer_renew.py
+          echo "脚本执行完毕，请查看上方日志是否显示「续期成功」"
+
+      - name: 上传失败截图（如有）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: |
+            debug_screenshot*.png
+            renew_screenshot*.png
+          if-no-files-found: ignore
+
+      - name: 续期后再次确认状态
+        if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'renew'))
+        env:
+          VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
+          VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASSWORD: ${{ secrets.VOER_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "----- 当前服务器状态 -----"
+          xvfb-run -a python3 voer_renew.py --status || true
