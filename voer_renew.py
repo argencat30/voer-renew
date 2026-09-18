@@ -10,9 +10,9 @@ Voer.host 免费服务器会话续期（Playwright 版）
 
 优先读取环境变量（适合 GitHub Actions / Docker / cron）：
     VOER_SERVER_ID        服务器 UUID（必须）
-    VOER_TOKEN            Cookie 里的 token JWT（优先；过期则自动邮箱登录刷新）
-    VOER_EMAIL            登录邮箱（token 过期时使用）
-    VOER_PASSWORD         登录密码（token 过期时使用）
+    VOER_EMAIL            登录邮箱（优先使用邮箱密码登录）
+    VOER_PASSWORD         登录密码
+    VOER_TOKEN            Cookie 里的 token JWT（邮箱登录失败时回退使用）
     TELEGRAM_BOT_TOKEN    Telegram Bot Token（可选，用于通知）
     TELEGRAM_CHAT_ID      Telegram Chat ID（可选，用于通知）
 
@@ -22,7 +22,7 @@ VPS / CI 无图形界面时必须用虚拟显示：
     xvfb-run -a python3 voer_renew.py
 
 用法：
-    python3 voer_renew.py            检查次数/到期时间；关机则开机；仅到期后续期
+    python3 voer_renew.py            关机则开机；有次数则续期；无次数则跳过
     python3 voer_renew.py --status   只看当前状态，不看广告
 """
 import json
@@ -740,34 +740,43 @@ def login_with_password(cfg) -> str | None:
 
 
 def ensure_token(cfg) -> bool:
-    """优先 VOER_TOKEN；无效则邮箱密码登录并自动更新 token。"""
-    token = (cfg.get("token") or "").strip()
-    if token and "在这里填" not in token and probe_token(cfg):
-        log(f"VOER_TOKEN 有效: {_jwt_hint(token)}")
-        return True
-
-    if token and token_looks_valid(token):
-        log("JWT 未过期但 API 探测未通过，尝试继续使用；若后续 401 会再登录")
-        # 仍先尝试邮箱刷新（更稳）
-    else:
-        log("VOER_TOKEN 缺失或已过期")
-
+    """优先邮箱密码登录；失败再使用 VOER_TOKEN。"""
     email = (cfg.get("email") or "").strip()
     password = (cfg.get("password") or "").strip()
-    if not email or not password:
-        log("无可用 token，且未配置 VOER_EMAIL / VOER_PASSWORD")
-        return False
+    token = (cfg.get("token") or "").strip()
+    if token and "在这里填" in token:
+        token = ""
 
-    log("尝试邮箱密码登录以刷新 VOER_TOKEN…")
-    new_token = login_with_password(cfg)
-    if not new_token:
-        return False
-    persist_token(cfg, new_token)
-    if probe_token(cfg):
-        log("新 token 探测通过")
-        return True
-    log("新 token 已写入，但 /api/auth/me 探测未通过（仍将尝试续期）")
-    return True
+    # 1) 优先邮箱密码
+    if email and password:
+        log(f"优先使用邮箱密码登录: {email}")
+        new_token = login_with_password(cfg)
+        if new_token:
+            persist_token(cfg, new_token)
+            if probe_token(cfg):
+                log("邮箱登录成功，token 探测通过")
+                return True
+            log("邮箱登录已取得 token，/api/auth/me 探测未通过（仍将尝试使用）")
+            return True
+        log("邮箱密码登录失败，回退到 VOER_TOKEN")
+    else:
+        log("未配置 VOER_EMAIL / VOER_PASSWORD，跳过邮箱登录")
+
+    # 2) 回退 VOER_TOKEN
+    if token:
+        cfg["token"] = token
+        if probe_token(cfg):
+            log(f"VOER_TOKEN 有效: {_jwt_hint(token)}")
+            return True
+        if token_looks_valid(token):
+            log(f"VOER_TOKEN JWT 未过期，尝试直接使用: {_jwt_hint(token)}")
+            return True
+        log(f"VOER_TOKEN 无效或已过期: {_jwt_hint(token)}")
+    else:
+        log("未配置可用的 VOER_TOKEN")
+
+    log("无法通过邮箱密码或 VOER_TOKEN 完成认证")
+    return False
 
 
 def today_used(server: dict) -> int:
@@ -1530,18 +1539,18 @@ def run_server(cfg, server_id, account=""):
         log(f"预检 API 失败: {e}，将继续尝试完整流程")
         pre = {}
 
-    pre_was_expired = bool(
-        pre and pre.get("sessionExpiresAt") and is_expired(pre.get("sessionExpiresAt"))
-    )
-
     if pre:
         q_pre = quota(pre)
         log_quota(pre, prefix="预检")
         log(f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}")
         log(f"开机状态: {pre.get('status')} — {status_text(pre.get('status'))}")
 
-        # 无次数 + 仍在运行 + 未到期 → 无可操作，跳过（TG+截图，不报错）
-        if q_pre["remaining"] <= 0 and is_running(pre) and not pre_was_expired:
+        # 关机优先开机：预检只提示，真正开机在面板流程里执行
+        if is_stopped(pre):
+            log("检测到关机/离线，将优先执行开机")
+
+        # 无续期次数且已在运行 → 跳过，不报错（关机时仍去开机）
+        if q_pre["remaining"] <= 0 and not is_stopped(pre):
             log(
                 f"可续期次数为 0（今日 {q_pre['used_today']}/{MAX_DAILY_EXTENSIONS}"
                 f" · 会话 {q_pre['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
@@ -1558,33 +1567,8 @@ def run_server(cfg, server_id, account=""):
                 log(f"跳过通知发送失败（不影响结果）: {e}")
             return None
 
-        # 未到期 + 有次数 + 在运行 → 按「到期后才续期」跳过（TG+截图）
-        if (
-            pre.get("sessionExpiresAt")
-            and not pre_was_expired
-            and q_pre["remaining"] > 0
-            and not is_stopped(pre)
-        ):
-            log(
-                "会话尚未到期，跳过续期（不报错）。"
-                f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}"
-            )
-            try:
-                notify_skip(
-                    cfg,
-                    account,
-                    server_id,
-                    pre,
-                    "尚未到期",
-                )
-            except Exception as e:
-                log(f"跳过通知发送失败（不影响结果）: {e}")
-            return None
-
-        if is_stopped(pre) and not pre_was_expired:
-            log("会话尚未到期，但服务器已关机，将仅执行开机（不续期）")
-        if pre_was_expired:
-            log("会话已到期，将开机（如需要）并尝试续期")
+        if q_pre["remaining"] > 0:
+            log(f"有可续期次数（{q_pre['remaining']}），将执行续期")
 
     success = False
     before = {}
@@ -1595,13 +1579,6 @@ def run_server(cfg, server_id, account=""):
     max_ext = max(1, int(cfg.get("extensions_per_run", 4)))
     rounds_ok = 0
     stop_reason = ""
-    # 仅当「预检时未到期且已关机」时，开机后不续期
-    only_power_on = bool(
-        pre
-        and pre.get("sessionExpiresAt")
-        and not pre_was_expired
-        and is_stopped(pre)
-    )
 
     watch_labels = [
         "觀看廣告",
@@ -1696,9 +1673,7 @@ def run_server(cfg, server_id, account=""):
                 log_quota(before, prefix="开机后检查")
                 log(f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}")
 
-            # 开机成功后：以「本次开机时刻」为基准重新取状态与次数。
-            # sessionExtensionsDate 若不是今天（UTC），today_used 已按 0 计；
-            # 会话计数以开机后 API 返回的 sessionExtensions 为准（新会话通常为 0）。
+            # 开机成功后：以本次开机时间为准刷新状态
             if did_power:
                 before = api_state(cfg, server_id)
                 log("以本次开机时间为准，刷新会话/次数状态")
@@ -1712,7 +1687,7 @@ def run_server(cfg, server_id, account=""):
 
             q_now = quota(before)
 
-            # 可续期次数为 0 → 跳过（TG+截图，不报错）
+            # 无续期次数 → 跳过，不报错
             if q_now["remaining"] <= 0:
                 log(
                     f"可续期次数为 0（今日 {q_now['used_today']}/{MAX_DAILY_EXTENSIONS}"
@@ -1743,72 +1718,11 @@ def run_server(cfg, server_id, account=""):
                     "今日计数以开机/当前 UTC 日为准（已用按 0）"
                 )
 
-            # 规则：
-            # 1) 本次刚开机（did_power）且有次数 → 立即进入续期（新会话可点延伸）
-            # 2) 预检未到期且仅开机（only_power_on）→ 不续期
-            # 3) 未开机、未到期 → 不续期（等到期后再跑）
-            if only_power_on and not did_power:
-                log(
-                    "仅执行开机逻辑且未实际开机，跳过续期。"
-                    f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
-                )
-                shot = take_screenshot(page, "skip_screenshot.png")
-                try:
-                    notify_godlike(
-                        cfg,
-                        account,
-                        short_id,
-                        "⏭️跳过续期（尚未到期）",
-                        seconds_until(before.get("sessionExpiresAt")),
-                        before.get("status"),
-                        photo=shot,
-                        remaining_text=fmt_quota(q_now)
-                        + "\n📅下次续期: "
-                        + fmt_next_renewal(before.get("sessionExpiresAt")),
-                    )
-                except Exception as e:
-                    log(f"跳过通知发送失败（不影响结果）: {e}")
-                return None
-
-            if (
-                not did_power
-                and not pre_was_expired
-                and before.get("sessionExpiresAt")
-                and not is_expired(before.get("sessionExpiresAt"))
-            ):
-                log(
-                    "会话尚未到期且本次未开机，不执行续期。"
-                    f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
-                )
-                shot = take_screenshot(page, "skip_screenshot.png")
-                try:
-                    notify_godlike(
-                        cfg,
-                        account,
-                        short_id,
-                        "⏭️跳过（尚未到期）",
-                        seconds_until(before.get("sessionExpiresAt")),
-                        before.get("status"),
-                        photo=shot,
-                        remaining_text=fmt_quota(q_now)
-                        + "\n📅下次续期: "
-                        + fmt_next_renewal(before.get("sessionExpiresAt")),
-                    )
-                except Exception as e:
-                    log(f"跳过通知发送失败（不影响结果）: {e}")
-                return None
-
-            if did_power:
-                log(
-                    "开机完成且有可续期次数，开始点击续期。"
-                    f"{fmt_quota(q_now)} | {fmt_next_renewal(before.get('sessionExpiresAt'))}"
-                )
-            else:
-                log(
-                    "开始续期。"
-                    f"到期时间: {fmt_next_renewal(before.get('sessionExpiresAt'))} | "
-                    f"{fmt_quota(q_now)}"
-                )
+            # 有续期次数 → 执行续期
+            log(
+                f"有可续期次数，开始续期。"
+                f"{fmt_quota(q_now)} | {fmt_next_renewal(before.get('sessionExpiresAt'))}"
+            )
 
             # ===== 单次运行内连续续期：每轮 = 点延伸 + 看 3 个广告 + 验证 +4h =====
             for round_no in range(1, max_ext + 1):
@@ -2014,7 +1928,7 @@ def main():
     cfg = load_config()
     server_ids = cfg.get("server_ids") or [cfg["server_id"]]
 
-    # 优先 VOER_TOKEN；过期则邮箱密码登录并自动更新 token
+    # 优先邮箱密码登录；失败再使用 VOER_TOKEN
     if not ensure_token(cfg):
         log("无法获得有效 VOER_TOKEN，退出")
         sys.exit(1)
@@ -2057,7 +1971,7 @@ def main():
         if ok is True:
             mark = "✅ 成功"
         elif ok is None:
-            mark = "⏭️ 跳过（无可用次数 / 尚未到期）"
+            mark = "⏭️ 跳过（无可用次数）"
         else:
             mark = "❌ 失败"
         if ok is False:
