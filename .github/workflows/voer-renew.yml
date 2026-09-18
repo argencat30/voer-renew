@@ -3,7 +3,9 @@
 #
 # 使用前必须在仓库 Settings → Secrets and variables → Actions 里添加：
 #   VOER_SERVER_ID   = 服务器 UUID（支持多个！用英文逗号分隔即可，见下）
-#   VOER_TOKEN          = Cookie 中的 token（JWT）
+#   VOER_TOKEN          = Cookie 中的 token（JWT，优先使用）
+#   VOER_EMAIL          = （可选）登录邮箱；token 过期时自动登录刷新 token
+#   VOER_PASSWORD       = （可选）登录密码
 #   TELEGRAM_BOT_TOKEN  = （可选）Telegram Bot Token，用于续期结果通知+截图
 #   TELEGRAM_CHAT_ID    = （可选）Telegram Chat ID
 #
@@ -96,29 +98,40 @@ jobs:
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASSWORD: ${{ secrets.VOER_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ -z "$VOER_SERVER_ID" ] || [ -z "$VOER_TOKEN" ]; then
-            echo "❌ 缺少 Secrets！"
-            echo "请到仓库 Settings → Secrets and variables → Actions 添加："
-            echo "  VOER_SERVER_ID = 你的服务器 UUID"
-            echo "  VOER_TOKEN     = Cookie 里的 token（JWT）"
-            echo ""
-            echo "获取方法见本文件顶部注释，或 README.md"
+          if [ -z "$VOER_SERVER_ID" ]; then
+            echo "❌ 缺少 VOER_SERVER_ID！"
+            exit 1
+          fi
+          if [ -z "$VOER_TOKEN" ] && { [ -z "$VOER_EMAIL" ] || [ -z "$VOER_PASSWORD" ]; }; then
+            echo "❌ 缺少认证 Secrets！"
+            echo "请至少配置 VOER_TOKEN，或同时配置 VOER_EMAIL + VOER_PASSWORD"
             exit 1
           fi
           # 只打印长度和开头，不泄露完整 secret
           echo "✅ 必要 Secrets 已配置"
           echo "  VOER_SERVER_ID 长度=${#VOER_SERVER_ID}, 开头=${VOER_SERVER_ID:0:8}..."
-          echo "  VOER_TOKEN     长度=${#VOER_TOKEN}, 开头=${VOER_TOKEN:0:8}..."
-          DOTS=$(echo -n "$VOER_TOKEN" | tr -cd '.' | wc -c)
-          echo "  VOER_TOKEN 中 . 的数量=$DOTS（标准 JWT 应为 2）"
-          if [[ ! "$VOER_TOKEN" == eyJ* ]]; then
-            echo "⚠️  警告：正常 JWT 一般以 eyJ 开头，当前开头异常，可能复制错了"
+          if [ -n "$VOER_TOKEN" ]; then
+            echo "  VOER_TOKEN     长度=${#VOER_TOKEN}, 开头=${VOER_TOKEN:0:8}..."
+            DOTS=$(echo -n "$VOER_TOKEN" | tr -cd '.' | wc -c)
+            echo "  VOER_TOKEN 中 . 的数量=$DOTS（标准 JWT 应为 2）"
+            if [[ ! "$VOER_TOKEN" == eyJ* ]]; then
+              echo "⚠️  警告：正常 JWT 一般以 eyJ 开头，当前开头异常，可能复制错了"
+            fi
+            if [ "$DOTS" -ne 2 ]; then
+              echo "⚠️  警告：标准 JWT 应有 2 个点（3 段），当前点数=$DOTS，可能复制不完整"
+            fi
+          else
+            echo "  VOER_TOKEN     未设置（将使用邮箱密码登录）"
           fi
-          if [ "$DOTS" -ne 2 ]; then
-            echo "⚠️  警告：标准 JWT 应有 2 个点（3 段），当前点数=$DOTS，可能复制不完整"
+          if [ -n "$VOER_EMAIL" ]; then
+            echo "  VOER_EMAIL     已设置（token 过期时可自动登录刷新）"
+          else
+            echo "  VOER_EMAIL     未设置"
           fi
           # Telegram（可选）
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
@@ -138,6 +151,8 @@ jobs:
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASSWORD: ${{ secrets.VOER_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -150,6 +165,8 @@ jobs:
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASSWORD: ${{ secrets.VOER_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # 可选：覆盖默认值
@@ -177,6 +194,8 @@ jobs:
         env:
           VOER_SERVER_ID: ${{ secrets.VOER_SERVER_ID }}
           VOER_TOKEN: ${{ secrets.VOER_TOKEN }}
+          VOER_EMAIL: ${{ secrets.VOER_EMAIL }}
+          VOER_PASSWORD: ${{ secrets.VOER_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
