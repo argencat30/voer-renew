@@ -1273,10 +1273,24 @@ def run_server(cfg, server_id, account=""):
                 log_quota(before, prefix="开机后检查")
                 log(f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}")
 
-            # 可续期次数为 0 → 跳过（TG+截图，不报错）
-            # 若预检时已到期，开机后可能换了新会话，次数可能已刷新，故不在此处拦截
+            # 开机成功后：以「本次开机时刻」为基准重新取状态与次数。
+            # sessionExtensionsDate 若不是今天（UTC），today_used 已按 0 计；
+            # 会话计数以开机后 API 返回的 sessionExtensions 为准（新会话通常为 0）。
+            if did_power:
+                before = api_state(cfg, server_id)
+                log("以本次开机时间为准，刷新会话/次数状态")
+                log(
+                    f"sessionExtensionsDate={before.get('sessionExtensionsDate')} "
+                    f"（UTC 今日={datetime.now(timezone.utc).strftime('%Y-%m-%d')}；"
+                    f"非今日则今日已用按 0）"
+                )
+                log_quota(before, prefix="开机后基准")
+                log(f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}")
+
             q_now = quota(before)
-            if q_now["remaining"] <= 0 and not pre_was_expired:
+
+            # 可续期次数为 0 → 跳过（TG+截图，不报错）
+            if q_now["remaining"] <= 0:
                 log(
                     f"可续期次数为 0（今日 {q_now['used_today']}/{MAX_DAILY_EXTENSIONS}"
                     f" · 会话 {q_now['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
@@ -1298,20 +1312,21 @@ def run_server(cfg, server_id, account=""):
                 except Exception as e:
                     log(f"跳过通知发送失败（不影响结果）: {e}")
                 return None
+
             if int(before.get("sessionExtensionsToday") or 0) >= MAX_DAILY_EXTENSIONS and q_now["used_today"] == 0:
                 log(
-                    "注意：sessionExtensionsToday="
-                    f"{before.get('sessionExtensionsToday')} 但 sessionExtensionsDate="
+                    "sessionExtensionsDate="
                     f"{before.get('sessionExtensionsDate')} 不是今天（UTC），"
-                    "该计数已过期，按 0 处理"
+                    "今日计数以开机/当前 UTC 日为准（已用按 0）"
                 )
 
-            # 仅「到期之后」才执行续期。
-            # 例外：预检时已到期（pre_was_expired）→ 开机后新会话允许续期。
-            # only_power_on：预检未到期但关机 → 只开机不续期。
-            if only_power_on:
+            # 规则：
+            # 1) 本次刚开机（did_power）且有次数 → 立即进入续期（新会话可点延伸）
+            # 2) 预检未到期且仅开机（only_power_on）→ 不续期
+            # 3) 未开机、未到期 → 不续期（等到期后再跑）
+            if only_power_on and not did_power:
                 log(
-                    "仅执行开机（预检时会话未到期）。"
+                    "仅执行开机逻辑且未实际开机，跳过续期。"
                     f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
                 )
                 shot = take_screenshot(page, "skip_screenshot.png")
@@ -1320,11 +1335,11 @@ def run_server(cfg, server_id, account=""):
                         cfg,
                         account,
                         short_id,
-                        "⏭️跳过续期（仅开机，尚未到期）",
+                        "⏭️跳过续期（尚未到期）",
                         seconds_until(before.get("sessionExpiresAt")),
                         before.get("status"),
                         photo=shot,
-                        remaining_text=fmt_quota(quota(before))
+                        remaining_text=fmt_quota(q_now)
                         + "\n📅下次续期: "
                         + fmt_next_renewal(before.get("sessionExpiresAt")),
                     )
@@ -1333,12 +1348,13 @@ def run_server(cfg, server_id, account=""):
                 return None
 
             if (
-                not pre_was_expired
+                not did_power
+                and not pre_was_expired
                 and before.get("sessionExpiresAt")
                 and not is_expired(before.get("sessionExpiresAt"))
             ):
                 log(
-                    "会话尚未到期，不执行续期。"
+                    "会话尚未到期且本次未开机，不执行续期。"
                     f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
                 )
                 shot = take_screenshot(page, "skip_screenshot.png")
@@ -1351,7 +1367,7 @@ def run_server(cfg, server_id, account=""):
                         seconds_until(before.get("sessionExpiresAt")),
                         before.get("status"),
                         photo=shot,
-                        remaining_text=fmt_quota(quota(before))
+                        remaining_text=fmt_quota(q_now)
                         + "\n📅下次续期: "
                         + fmt_next_renewal(before.get("sessionExpiresAt")),
                     )
@@ -1359,36 +1375,17 @@ def run_server(cfg, server_id, account=""):
                     log(f"跳过通知发送失败（不影响结果）: {e}")
                 return None
 
-            # 预检已到期且开机后次数仍为 0：无法续期，跳过并通知
-            q_chk = quota(before)
-            if q_chk["remaining"] <= 0:
+            if did_power:
                 log(
-                    f"可续期次数仍为 0（今日 {q_chk['used_today']}/{MAX_DAILY_EXTENSIONS}"
-                    f" · 会话 {q_chk['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
+                    "开机完成且有可续期次数，开始点击续期。"
+                    f"{fmt_quota(q_now)} | {fmt_next_renewal(before.get('sessionExpiresAt'))}"
                 )
-                shot = take_screenshot(page, "skip_screenshot.png")
-                try:
-                    notify_godlike(
-                        cfg,
-                        account,
-                        short_id,
-                        "⏭️跳过（无可用次数）",
-                        seconds_until(before.get("sessionExpiresAt")),
-                        before.get("status"),
-                        photo=shot,
-                        remaining_text=fmt_quota(q_chk)
-                        + "\n📅下次续期: "
-                        + fmt_next_renewal(before.get("sessionExpiresAt")),
-                    )
-                except Exception as e:
-                    log(f"跳过通知发送失败（不影响结果）: {e}")
-                return None
-
-            log(
-                "开始续期。"
-                f"到期时间: {fmt_next_renewal(before.get('sessionExpiresAt'))} | "
-                f"{fmt_quota(quota(before))}"
-            )
+            else:
+                log(
+                    "开始续期。"
+                    f"到期时间: {fmt_next_renewal(before.get('sessionExpiresAt'))} | "
+                    f"{fmt_quota(q_now)}"
+                )
 
             # ===== 单次运行内连续续期：每轮 = 点延伸 + 看 3 个广告 + 验证 +4h =====
             for round_no in range(1, max_ext + 1):
