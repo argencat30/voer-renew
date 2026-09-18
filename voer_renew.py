@@ -20,7 +20,7 @@ VPS / CI 无图形界面时必须用虚拟显示：
     xvfb-run -a python3 voer_renew.py
 
 用法：
-    python3 voer_renew.py            检查次数/到期时间；关机则开机；仅到期后续期
+    python3 voer_renew.py            自动续期一次（3 个广告，约 3 分钟）
     python3 voer_renew.py --status   只看当前状态，不看广告
 """
 import json
@@ -49,7 +49,6 @@ DEFAULT_CONFIG = {
     "ads_per_extension": 3,
     "ad_duration_sec": 32,
     "extensions_per_run": 4,   # 单次运行内最多连续续期几次（受平台每日/每会话 4 次上限约束）
-    "restart_if_stopped": True,  # 关机/离线时先重启，就绪后再续期
     "headless": False,
     "use_system_chrome": False,
     "telegram_bot_token": "",
@@ -58,22 +57,6 @@ DEFAULT_CONFIG = {
 }
 
 from playwright.sync_api import sync_playwright
-
-MAX_DAILY_EXTENSIONS = 4
-MAX_SESSION_EXTENSIONS = 4
-
-RUNNING_STATUSES = {"running", "online"}
-STOPPED_STATUSES = {"stopped", "offline"}
-CRASHED_STATUSES = {"crashed", "error", "provisioning_error", "supervisor_error"}
-STARTING_STATUSES = {
-    "starting",
-    "provisioning",
-    "pending",
-    "starting_node",
-    "restarting",
-    "migrating",
-}
-STOPPING_STATUSES = {"stopping"}
 
 
 def log(*a):
@@ -225,8 +208,8 @@ def fmt_duration(seconds) -> str:
     return f"{h}h {m:02d}m"
 
 
-def parse_iso(iso_str):
-    """解析 ISO 时间为带时区的 datetime；失败返回 None。"""
+def seconds_until(iso_str) -> int | None:
+    """距离某个 ISO 时间还有多少秒（已过期返回 0，解析失败返回 None）。"""
     if not iso_str:
         return None
     try:
@@ -234,44 +217,9 @@ def parse_iso(iso_str):
         dt = datetime.fromisoformat(t)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        return max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
     except Exception:
         return None
-
-
-def seconds_until(iso_str) -> int | None:
-    """距离某个 ISO 时间还有多少秒（已过期返回 0，解析失败返回 None）。"""
-    dt = parse_iso(iso_str)
-    if dt is None:
-        return None
-    return max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
-
-
-def is_expired(iso_str) -> bool:
-    """会话是否已到期。无法解析时视为未到期（避免误续期）。"""
-    dt = parse_iso(iso_str)
-    if dt is None:
-        return False
-    return dt <= datetime.now(timezone.utc)
-
-
-def fmt_next_renewal(iso_str) -> str:
-    """下次续期准确时间：绝对时间（UTC + 本地）+ 剩余时长。"""
-    dt = parse_iso(iso_str)
-    if dt is None:
-        return "—"
-    now = datetime.now(timezone.utc)
-    sec = max(0, int((dt - now).total_seconds()))
-    utc_s = dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    # 本地时区：优先 Asia/Shanghai 展示，失败则用系统本地
-    try:
-        from zoneinfo import ZoneInfo
-        local_s = dt.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S CST")
-    except Exception:
-        local_s = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    if sec <= 0:
-        return f"{utc_s} / {local_s}（已到期，可立即续期）"
-    return f"{utc_s} / {local_s}（剩余 {fmt_duration(sec)}）"
 
 
 def status_text(status) -> str:
@@ -329,24 +277,17 @@ def fetch_account_email(cfg) -> str:
         return ""
 
 
-def notify_godlike(cfg, account, server_id, result, uptime_sec, status, photo=None, remaining_text=""):
-    """按固定模板发送续期通知；若传入 photo 则附带真实面板截图。"""
+def notify_godlike(cfg, account, server_id, result, uptime_sec, status):
+    """按固定模板发送续期通知（纯文本）。"""
     lines = [
         f"⏰运行时间: {fmt_local_time()}",
         f"🖥️账号: {account or '—'}",
         f"🖥️服务器: {server_id}",
         f"🔢下次可续期: {fmt_duration(uptime_sec)}",
-        f"🔢可续期次数: {remaining_text or '—'}",
         f"📊续期结果: {result}",
         f"📊开机状态: {status_text(status)}",
     ]
-    shot = None
-    if photo is not None:
-        shot = photo if isinstance(photo, pathlib.Path) else pathlib.Path(photo)
-        if not shot.exists():
-            log(f"通知截图不存在: {shot}")
-            shot = None
-    notify(cfg, cfg.get("tg_title") or "Godlike 续期通知", lines, photo=shot)
+    notify(cfg, cfg.get("tg_title") or "Godlike 续期通知", lines)
 
 
 # ---------------------------------------------------------------------------
@@ -413,298 +354,6 @@ def today_used(server: dict) -> int:
         return 0
 
 
-def quota(server: dict) -> dict:
-    """计算可续期次数。
-
-    平台同时限制：每 UTC 日最多 4 次、每个会话最多 4 次。
-    可续期次数 = min(今日剩余, 本会话剩余)。
-    必须用 today_used() 结合 sessionExtensionsDate，跨日时当日计数会过期。
-    """
-    used_today = today_used(server)
-    try:
-        session_ext = int(server.get("sessionExtensions") or 0)
-    except Exception:
-        session_ext = 0
-    session_ext = max(0, session_ext)
-    daily_left = max(0, MAX_DAILY_EXTENSIONS - used_today)
-    session_left = max(0, MAX_SESSION_EXTENSIONS - session_ext)
-    remaining = min(daily_left, session_left)
-    return {
-        "used_today": used_today,
-        "session_ext": session_ext,
-        "daily_left": daily_left,
-        "session_left": session_left,
-        "remaining": remaining,
-        "daily_max": MAX_DAILY_EXTENSIONS,
-        "session_max": MAX_SESSION_EXTENSIONS,
-    }
-
-
-def fmt_quota(q: dict) -> str:
-    return (
-        f"可续期次数: {q['remaining']} 次"
-        f"（今日剩余 {q['daily_left']}/{q['daily_max']}"
-        f" · 本会话剩余 {q['session_left']}/{q['session_max']}"
-        f" | 今日已用 {q['used_today']}/{q['daily_max']}"
-        f"，会话已用 {q['session_ext']}/{q['session_max']}）"
-    )
-
-
-def log_quota(server: dict, prefix: str = "") -> dict:
-    q = quota(server)
-    head = prefix if prefix else "检查"
-    log(f"{head}{fmt_quota(q)}")
-    return q
-
-
-def server_status_key(server) -> str:
-    if not server:
-        return ""
-    return str(server.get("status") or "").strip().lower()
-
-
-def is_running(server) -> bool:
-    return server_status_key(server) in RUNNING_STATUSES
-
-
-def is_stopped(server) -> bool:
-    return server_status_key(server) in STOPPED_STATUSES
-
-
-def is_crashed(server) -> bool:
-    return server_status_key(server) in CRASHED_STATUSES
-
-
-def is_starting(server) -> bool:
-    return server_status_key(server) in STARTING_STATUSES
-
-
-def api_post(cfg, path: str, payload=None, timeout: int = 60):
-    """POST voer.host API。返回 (status_code, body_dict)。失败不 sys.exit。"""
-    url = path if path.startswith("http") else f"https://voer.host{path}"
-    body = json.dumps(payload if payload is not None else {}).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Cookie": f"token={cfg['token']}",
-            "Authorization": f"Bearer {cfg['token']}",
-            "User-Agent": UA,
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read().decode(errors="replace")
-            try:
-                data = json.loads(raw) if raw.strip() else {}
-            except Exception:
-                data = {"raw": raw[:300]}
-            return r.status, data
-    except urllib.error.HTTPError as e:
-        raw = ""
-        try:
-            raw = e.read().decode(errors="replace")[:800]
-        except Exception:
-            pass
-        data = {}
-        try:
-            data = json.loads(raw) if raw else {}
-        except Exception:
-            data = {"error": raw or str(e.reason)}
-        return e.code, data
-    except Exception as e:
-        log(f"API POST 异常 {url}: {e}")
-        return 0, {"error": str(e)}
-
-
-def api_power(cfg, server_id: str, action: str, extra=None):
-    """电源操作：start / stop / restart / kill。"""
-    payload = dict(extra or {})
-    code, data = api_post(cfg, f"/api/servers/{server_id}/{action}", payload)
-    err = ""
-    if isinstance(data, dict):
-        err = str(data.get("error") or data.get("message") or "")
-    log(f"电源指令 {action}: HTTP {code}" + (f" {err}" if err else ""))
-    return code, data
-
-
-def wait_for_status(cfg, server_id: str, want, timeout: int = 300, poll: float = 5):
-    """轮询直到 status 落入 want 集合，超时返回最后一次状态。"""
-    want = {str(x).lower() for x in want}
-    deadline = time.time() + timeout
-    last = None
-    while time.time() < deadline:
-        try:
-            last = api_state(cfg, server_id)
-        except SystemExit:
-            time.sleep(poll)
-            continue
-        except Exception as e:
-            log(f"轮询状态失败: {e}")
-            time.sleep(poll)
-            continue
-        st = server_status_key(last)
-        log(f"等待开机: 当前状态={st or '未知'}")
-        if st in want:
-            return last
-        time.sleep(poll)
-    return last
-
-
-def click_start_button(page) -> str | None:
-    start_labels = [
-        "Start",
-        "启动",
-        "开机",
-        "開機",
-        "開始",
-        "Recover",
-        "恢复",
-        "恢復",
-        "Start server",
-    ]
-    hit = click_anywhere(page, start_labels, 20000)
-    if not hit:
-        hit = click_anywhere(page, start_labels, 15000, exact=False)
-    return hit
-
-
-def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
-    """点击 Watch ad 并等待播放，返回实际点击的广告数。"""
-    watch_labels = [
-        "Watch ad",
-        "觀看廣告",
-        "观看广告",
-        "Watch Ad",
-        "Watch ads",
-        "Watch Ads",
-        "Watch",
-        "开始",
-        "開始",
-    ]
-    page.wait_for_timeout(4000)
-    hit = click_anywhere(page, watch_labels, 25000) or click_anywhere(
-        page, watch_labels, 12000, exact=False
-    )
-    if hit:
-        log(f"{reason}: 已进入广告流程（{hit}）")
-    else:
-        log(f"{reason}: 未找到 Watch ad（可能无需广告，或已自动开始）")
-    page.wait_for_timeout(6000)
-    total = int(cfg.get("ads_per_extension") or 3)
-    watched = 0
-    for i in range(1, total + 1):
-        hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告"], 50000)
-        if not hit:
-            log(f"{reason}: 第 {i} 个 Watch ad 未找到，停止广告流程")
-            break
-        watched += 1
-        log(f"{reason}: 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
-        page.wait_for_timeout(int(cfg.get("ad_duration_sec") or 32) * 1000)
-        closed = click_anywhere(page, ["Close", "關閉", "关闭"], 40000)
-        log(
-            f"{reason}: 第 {i} 个广告:",
-            f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-        )
-        page.wait_for_timeout(5000)
-    return watched
-
-
-def restart_via_panel(cfg, page, reason: str = "关机后重启") -> bool:
-    """在面板点击 Start/开机，必要时看激励广告。"""
-    if page is None:
-        return False
-    hit = click_start_button(page)
-    if not hit:
-        log(f"{reason}: 面板上未找到 Start/开机 按钮")
-        return False
-    log(f"{reason}: 已点击开机入口: {hit}")
-    page.wait_for_timeout(2500)
-    watch_rewarded_ads(cfg, page, reason=reason)
-    return True
-
-
-def ads_required_error(code, data) -> bool:
-    if code == 403:
-        return True
-    blob = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data or "")
-    return "Ad requirement" in blob or "adsCompleted" in blob or "rewarded" in blob.lower()
-
-
-def ensure_running(cfg, server_id: str, page=None):
-    """仅检查是否关机：若为 stopped/offline 则开机或重启。
-
-    其他状态（running / starting / crashed 等）一律不处理。
-    返回 (server, did_power_on)。开机失败只记日志，不抛异常。
-    """
-    skip = str(os.environ.get("VOER_SKIP_RESTART", "")).strip().lower() in ("1", "true", "yes")
-    if skip or not cfg.get("restart_if_stopped", True):
-        return api_state(cfg, server_id), False
-
-    server = api_state(cfg, server_id)
-    st = server_status_key(server)
-    log(f"开机状态: {st or '未知'} — {status_text(st)}")
-
-    # 只处理明确关机/离线
-    if not is_stopped(server):
-        if is_running(server):
-            log("服务器已在运行中，无需开机")
-        elif is_starting(server):
-            log("服务器启动中，等待就绪…")
-            server = wait_for_status(cfg, server_id, RUNNING_STATUSES, timeout=360) or server
-        else:
-            log(f"当前状态非关机（{st or '未知'}），跳过开机/重启")
-        return server, False
-
-    log("检测到关机/离线：执行开机或重启")
-    accepted = False
-    need_ads = False
-    for act in ("start", "restart"):
-        log(f"发送电源指令: {act}")
-        extra = {"adsCompleted": 0} if act == "start" else {}
-        code, data = api_power(cfg, server_id, act, extra)
-        if code in (200, 201, 202, 204):
-            accepted = True
-            if isinstance(data, dict) and data.get("server"):
-                server = data["server"]
-            break
-        if ads_required_error(code, data):
-            need_ads = True
-            log("开机需要先看激励广告，改为在面板点击 Start 并播放广告")
-            break
-        log(f"{act} 未成功，尝试下一指令")
-
-    if need_ads or not accepted:
-        if page is not None:
-            restart_via_panel(cfg, page, reason="关机后开机")
-        elif need_ads:
-            log("开机需要看广告，但当前没有浏览器会话，无法完成开机")
-            return server, False
-
-    server = wait_for_status(cfg, server_id, RUNNING_STATUSES, timeout=360) or api_state(
-        cfg, server_id
-    )
-    if not is_running(server) and page is not None and not need_ads:
-        log("API 开机后仍未运行，尝试面板开机")
-        restart_via_panel(cfg, page, reason="关机后开机（面板兜底）")
-        server = wait_for_status(
-            cfg, server_id, RUNNING_STATUSES, timeout=240
-        ) or api_state(cfg, server_id)
-
-    if is_running(server):
-        log("开机完成，服务器已在运行")
-        return server, True
-
-    log(
-        f"开机后服务器仍未运行（当前状态: {server_status_key(server) or '未知'}），"
-        "不报错，继续后续流程"
-    )
-    return server, False
-
-
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
 
@@ -736,9 +385,6 @@ def load_config():
         cfg["ad_duration_sec"] = int(os.environ["VOER_AD_DURATION_SEC"])
     if os.environ.get("VOER_EXTENSIONS_PER_RUN"):
         cfg["extensions_per_run"] = int(os.environ["VOER_EXTENSIONS_PER_RUN"])
-    skip_restart = os.environ.get("VOER_SKIP_RESTART", "").strip().lower()
-    if skip_restart in ("1", "true", "yes"):
-        cfg["restart_if_stopped"] = False
     env_tg_title = os.environ.get("TG_TITLE", "").strip().strip('"').strip("'")
     if env_tg_title:
         cfg["tg_title"] = env_tg_title
@@ -828,26 +474,56 @@ def api_state(cfg, server_id=None):
         raise SystemExit(1) from e
 
 
-def click_anywhere(page, texts, timeout_ms, exact=True):
+def click_anywhere(page, texts, timeout_ms, exact=True, force=False, prefer_ad_frames=False):
+    """在所有 frame 查找并点击。prefer_ad_frames=True 时优先 wormies/googleads。"""
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
-        for frame in page.frames:
+        frames = list(page.frames)
+        if prefer_ad_frames:
+            def _score(fr):
+                u = (fr.url or "").lower()
+                if "wormies" in u:
+                    return 0
+                if any(k in u for k in ("googleads", "doubleclick", "pagead", "voer-ads")):
+                    return 1
+                if "voer.host/panel" in u:
+                    return 3
+                return 2
+            frames = sorted(frames, key=_score)
+        for frame in frames:
             for t in texts:
                 makers = [
                     lambda t=t, f=frame: f.get_by_role("button", name=t, exact=exact).first,
                     lambda t=t, f=frame: f.get_by_text(t, exact=exact).first,
+                    lambda t=t, f=frame: f.get_by_role("button", name=t, exact=False).first,
+                    lambda t=t, f=frame: f.get_by_text(t, exact=False).first,
                     lambda t=t, f=frame: f.locator(f"button:has-text('{t}')").first,
                     lambda t=t, f=frame: f.locator(f"[role=button]:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"div:has-text('{t}')").first,
+                    lambda t=t, f=frame: f.locator(f"text={t}").first,
                 ]
                 for maker in makers:
                     try:
                         loc = maker()
-                        if loc.count() and loc.is_visible():
-                            loc.click(timeout=3000)
-                            return f"{t}@{frame.url[:60]}"
+                        if not loc.count():
+                            continue
+                        try:
+                            visible = loc.is_visible()
+                        except Exception:
+                            visible = False
+                        if not (visible or force):
+                            continue
+                        try:
+                            loc.click(timeout=4000, force=force)
+                        except Exception:
+                            try:
+                                loc.evaluate("el => el.click()")
+                            except Exception:
+                                continue
+                        return f"{t}@{(frame.url or '')[:70]}"
                     except Exception:
                         pass
-        time.sleep(1.2)
+        time.sleep(1.0)
     return None
 
 
@@ -861,95 +537,13 @@ def _shot_name(base: str) -> str:
 
 
 def take_screenshot(page, name="screenshot.png") -> pathlib.Path:
-    """截取当前浏览器真实页面（面板状态），供 Telegram 发送。"""
     path = pathlib.Path(_shot_name(name))
     try:
-        try:
-            page.wait_for_timeout(800)
-        except Exception:
-            pass
-        try:
-            page.screenshot(path=str(path), full_page=True, type="png")
-        except Exception:
-            page.screenshot(path=str(path), full_page=False, type="png")
-        size = path.stat().st_size if path.exists() else 0
-        log(f"截图已保存: {path.resolve()} ({size} bytes)")
-        if size < 1000:
-            log("警告: 截图文件过小，可能是空白页")
+        page.screenshot(path=str(path), full_page=True)
+        log(f"截图已保存: {path.resolve()}")
     except Exception as e:
         log(f"截图失败: {e}")
     return path
-
-
-def capture_panel_shot(cfg, server_id: str, name: str = "skip_screenshot.png"):
-    """短暂打开面板截一张真实截图（用于跳过时的 TG 通知）。失败返回 None。"""
-    url = f"https://voer.host/panel/server/{server_id}"
-    path = pathlib.Path(_shot_name(name))
-    try:
-        with sync_playwright() as p:
-            launch = dict(
-                headless=cfg.get("headless", False),
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--window-size=1400,1000",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            if cfg.get("use_system_chrome"):
-                launch["channel"] = "chrome"
-            browser = p.chromium.launch(**launch)
-            try:
-                ctx = browser.new_context(viewport={"width": 1400, "height": 1000})
-                ctx.add_cookies(
-                    [
-                        {
-                            "name": "token",
-                            "value": cfg["token"],
-                            "domain": "voer.host",
-                            "path": "/",
-                            "secure": True,
-                        }
-                    ]
-                )
-                page = ctx.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=12000)
-                except Exception:
-                    pass
-                page.wait_for_timeout(3000)
-                take_screenshot(page, name)
-            finally:
-                browser.close()
-        if path.exists() and path.stat().st_size >= 1000:
-            return path
-        return path if path.exists() else None
-    except Exception as e:
-        log(f"跳过流程截图失败（不影响跳过本身）: {e}")
-        return None
-
-
-def notify_skip(cfg, account, server_id, server: dict, reason: str):
-    """跳过时发送 TG 通知并尽量附带面板截图。不抛错。"""
-    short_id = (server_id or "")[:8] + "…"
-    q = quota(server) if server else {}
-    uptime = seconds_until((server or {}).get("sessionExpiresAt"))
-    remaining_text = fmt_quota(q) if q else "—"
-    next_text = fmt_next_renewal((server or {}).get("sessionExpiresAt"))
-    log(f"跳过原因: {reason}")
-    log(f"发送跳过通知（含截图）… 下次续期: {next_text}")
-    shot = capture_panel_shot(cfg, server_id, name="skip_screenshot.png")
-    notify_godlike(
-        cfg,
-        account,
-        short_id,
-        f"⏭️跳过（{reason}）",
-        uptime,
-        (server or {}).get("status"),
-        photo=shot,
-        remaining_text=remaining_text + "\n📅下次续期: " + next_text,
-    )
 
 
 def dump_page_debug(page, tag="debug"):
@@ -987,7 +581,7 @@ def dump_page_debug(page, tag="debug"):
 
 
 def run_server(cfg, server_id, account=""):
-    """对单台服务器执行一次完整续期流程。返回 True=成功，False/抛异常=失败，None=跳过。"""
+    """对单台服务器执行一次完整续期流程。返回 True=成功，False/抛异常=失败。"""
     url = f"https://voer.host/panel/server/{server_id}"
     short_id = server_id[:8] + "…"
 
@@ -1003,12 +597,7 @@ def run_server(cfg, server_id, account=""):
             "adsWatched",
         ):
             print(f"{k} = {s.get(k)}")
-        print(f"今日已续期(UTC, 计算值) = {today_used(s)} / {MAX_DAILY_EXTENSIONS}")
-        q = quota(s)
-        print(f"本会话已续期 = {q['session_ext']} / {MAX_SESSION_EXTENSIONS}")
-        print(fmt_quota(q))
-        print(f"开机状态 = {s.get('status')} ({status_text(s.get('status'))})")
-        print(f"下次续期准确时间 = {fmt_next_renewal(s.get('sessionExpiresAt'))}")
+        print(f"今日已续期(UTC, 计算值) = {today_used(s)} / 4")
         # status 也可发一条简短通知（可选）
         if os.environ.get("TG_NOTIFY_STATUS") == "1":
             notify(
@@ -1018,95 +607,20 @@ def run_server(cfg, server_id, account=""):
                     f"服务器: <code>{short_id}</code>",
                     f"状态: {s.get('status')}",
                     f"到期: {s.get('sessionExpiresAt')}",
-                    f"下次续期: {fmt_next_renewal(s.get('sessionExpiresAt'))}",
                     f"累计续期: {s.get('sessionExtensions')}",
-                    f"今日续期: {today_used(s)} / {MAX_DAILY_EXTENSIONS} (UTC)",
-                    f"{fmt_quota(q)}",
+                    f"今日续期: {today_used(s)} / 4 (UTC)",
                 ],
             )
         return True
 
-    # ===== 浏览器启动前：轻量检查，无次数 / 未到期则跳过（不报错）=====
-    try:
-        pre = api_state(cfg, server_id)
-    except SystemExit:
-        raise
-    except Exception as e:
-        log(f"预检 API 失败: {e}，将继续尝试完整流程")
-        pre = {}
-
-    pre_was_expired = bool(
-        pre and pre.get("sessionExpiresAt") and is_expired(pre.get("sessionExpiresAt"))
-    )
-
-    if pre:
-        q_pre = quota(pre)
-        log_quota(pre, prefix="预检")
-        log(f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}")
-        log(f"开机状态: {pre.get('status')} — {status_text(pre.get('status'))}")
-
-        # 无次数 + 仍在运行 + 未到期 → 无可操作，跳过（TG+截图，不报错）
-        if q_pre["remaining"] <= 0 and is_running(pre) and not pre_was_expired:
-            log(
-                f"可续期次数为 0（今日 {q_pre['used_today']}/{MAX_DAILY_EXTENSIONS}"
-                f" · 会话 {q_pre['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
-            )
-            try:
-                notify_skip(
-                    cfg,
-                    account,
-                    server_id,
-                    pre,
-                    "无可用次数",
-                )
-            except Exception as e:
-                log(f"跳过通知发送失败（不影响结果）: {e}")
-            return None
-
-        # 未到期 + 有次数 + 在运行 → 按「到期后才续期」跳过（TG+截图）
-        if (
-            pre.get("sessionExpiresAt")
-            and not pre_was_expired
-            and q_pre["remaining"] > 0
-            and not is_stopped(pre)
-        ):
-            log(
-                "会话尚未到期，跳过续期（不报错）。"
-                f"下次续期准确时间: {fmt_next_renewal(pre.get('sessionExpiresAt'))}"
-            )
-            try:
-                notify_skip(
-                    cfg,
-                    account,
-                    server_id,
-                    pre,
-                    "尚未到期",
-                )
-            except Exception as e:
-                log(f"跳过通知发送失败（不影响结果）: {e}")
-            return None
-
-        if is_stopped(pre) and not pre_was_expired:
-            log("会话尚未到期，但服务器已关机，将仅执行开机（不续期）")
-        if pre_was_expired:
-            log("会话已到期，将开机（如需要）并尝试续期")
-
     success = False
     before = {}
     now = {}
-    last_shot = None  # 结束时填入真实截图
     last_shot = pathlib.Path(_shot_name("renew_screenshot.png"))
     # 单次运行内最多连续续期几次（受平台每日 4 次 / 每会话 4 次上限约束）
     max_ext = max(1, int(cfg.get("extensions_per_run", 4)))
     rounds_ok = 0
     stop_reason = ""
-    # 仅当「预检时未到期且已关机」时，开机后不续期
-    only_power_on = bool(
-        pre
-        and pre.get("sessionExpiresAt")
-        and not pre_was_expired
-        and is_stopped(pre)
-    )
 
     watch_labels = [
         "觀看廣告",
@@ -1178,9 +692,23 @@ def run_server(cfg, server_id, account=""):
                 before.get("sessionExtensionsToday"),
                 f"(sessionExtensionsDate={before.get('sessionExtensionsDate')})",
             )
-            log(f"开机状态: {before.get('status')} — {status_text(before.get('status'))}")
-            log(f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}")
-            log_quota(before, prefix="检查")
+
+            # 今日已达上限时面板会隐藏续期入口，直接跳过（不算失败，不浪费搜索时间）
+            # 返回 None 表示「跳过」，区别于 True=成功 / False=失败
+            #
+            # 重要：必须用 today_used() 结合 sessionExtensionsDate 判断，
+            # 否则跨 UTC 日会读到过期的 sessionExtensionsToday（例如 4）而误判「今日已满」。
+            used_today = today_used(before)
+            if used_today >= 4:
+                log(f"今日续期次数已满（{used_today}/4，UTC 当日），平台已隐藏续期入口，跳过该服务器")
+                return None
+            if int(before.get("sessionExtensionsToday") or 0) >= 4 and used_today == 0:
+                log(
+                    "注意：sessionExtensionsToday="
+                    f"{before.get('sessionExtensionsToday')} 但 sessionExtensionsDate="
+                    f"{before.get('sessionExtensionsDate')} 不是今天（UTC），"
+                    "该计数已过期，按 0 处理，继续尝试续期"
+                )
 
             for accept_txt in ("Accept", "Accept all", "同意", "接受", "I agree", "OK"):
                 hit = click_anywhere(page, [accept_txt], 3000)
@@ -1188,155 +716,23 @@ def run_server(cfg, server_id, account=""):
                     log(f"已点同意弹窗: {hit}")
                     break
 
-            # 只检查是否关机：关机则开机/重启（不抛错）
-            before, did_power = ensure_running(cfg, server_id, page=page)
-            if did_power:
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(4000)
-                except Exception:
-                    pass
-                before = api_state(cfg, server_id)
-                log("开机之后再次检查可续期次数与到期时间")
-                log_quota(before, prefix="开机后检查")
-                log(f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}")
-
-            # 可续期次数为 0 → 跳过（TG+截图，不报错）
-            # 若预检时已到期，开机后可能换了新会话，次数可能已刷新，故不在此处拦截
-            q_now = quota(before)
-            if q_now["remaining"] <= 0 and not pre_was_expired:
-                log(
-                    f"可续期次数为 0（今日 {q_now['used_today']}/{MAX_DAILY_EXTENSIONS}"
-                    f" · 会话 {q_now['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
-                )
-                shot = take_screenshot(page, "skip_screenshot.png")
-                try:
-                    notify_godlike(
-                        cfg,
-                        account,
-                        short_id,
-                        "⏭️跳过（无可用次数）",
-                        seconds_until(before.get("sessionExpiresAt")),
-                        before.get("status"),
-                        photo=shot,
-                        remaining_text=fmt_quota(q_now)
-                        + "\n📅下次续期: "
-                        + fmt_next_renewal(before.get("sessionExpiresAt")),
-                    )
-                except Exception as e:
-                    log(f"跳过通知发送失败（不影响结果）: {e}")
-                return None
-            if int(before.get("sessionExtensionsToday") or 0) >= MAX_DAILY_EXTENSIONS and q_now["used_today"] == 0:
-                log(
-                    "注意：sessionExtensionsToday="
-                    f"{before.get('sessionExtensionsToday')} 但 sessionExtensionsDate="
-                    f"{before.get('sessionExtensionsDate')} 不是今天（UTC），"
-                    "该计数已过期，按 0 处理"
-                )
-
-            # 仅「到期之后」才执行续期。
-            # 例外：预检时已到期（pre_was_expired）→ 开机后新会话允许续期。
-            # only_power_on：预检未到期但关机 → 只开机不续期。
-            if only_power_on:
-                log(
-                    "仅执行开机（预检时会话未到期）。"
-                    f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
-                )
-                shot = take_screenshot(page, "skip_screenshot.png")
-                try:
-                    notify_godlike(
-                        cfg,
-                        account,
-                        short_id,
-                        "⏭️跳过续期（仅开机，尚未到期）",
-                        seconds_until(before.get("sessionExpiresAt")),
-                        before.get("status"),
-                        photo=shot,
-                        remaining_text=fmt_quota(quota(before))
-                        + "\n📅下次续期: "
-                        + fmt_next_renewal(before.get("sessionExpiresAt")),
-                    )
-                except Exception as e:
-                    log(f"跳过通知发送失败（不影响结果）: {e}")
-                return None
-
-            if (
-                not pre_was_expired
-                and before.get("sessionExpiresAt")
-                and not is_expired(before.get("sessionExpiresAt"))
-            ):
-                log(
-                    "会话尚未到期，不执行续期。"
-                    f"下次续期准确时间: {fmt_next_renewal(before.get('sessionExpiresAt'))}"
-                )
-                shot = take_screenshot(page, "skip_screenshot.png")
-                try:
-                    notify_godlike(
-                        cfg,
-                        account,
-                        short_id,
-                        "⏭️跳过（尚未到期）",
-                        seconds_until(before.get("sessionExpiresAt")),
-                        before.get("status"),
-                        photo=shot,
-                        remaining_text=fmt_quota(quota(before))
-                        + "\n📅下次续期: "
-                        + fmt_next_renewal(before.get("sessionExpiresAt")),
-                    )
-                except Exception as e:
-                    log(f"跳过通知发送失败（不影响结果）: {e}")
-                return None
-
-            # 预检已到期且开机后次数仍为 0：无法续期，跳过并通知
-            q_chk = quota(before)
-            if q_chk["remaining"] <= 0:
-                log(
-                    f"可续期次数仍为 0（今日 {q_chk['used_today']}/{MAX_DAILY_EXTENSIONS}"
-                    f" · 会话 {q_chk['session_ext']}/{MAX_SESSION_EXTENSIONS}），跳过，不报错"
-                )
-                shot = take_screenshot(page, "skip_screenshot.png")
-                try:
-                    notify_godlike(
-                        cfg,
-                        account,
-                        short_id,
-                        "⏭️跳过（无可用次数）",
-                        seconds_until(before.get("sessionExpiresAt")),
-                        before.get("status"),
-                        photo=shot,
-                        remaining_text=fmt_quota(q_chk)
-                        + "\n📅下次续期: "
-                        + fmt_next_renewal(before.get("sessionExpiresAt")),
-                    )
-                except Exception as e:
-                    log(f"跳过通知发送失败（不影响结果）: {e}")
-                return None
-
-            log(
-                "开始续期。"
-                f"到期时间: {fmt_next_renewal(before.get('sessionExpiresAt'))} | "
-                f"{fmt_quota(quota(before))}"
-            )
-
             # ===== 单次运行内连续续期：每轮 = 点延伸 + 看 3 个广告 + 验证 +4h =====
             for round_no in range(1, max_ext + 1):
                 cur = api_state(cfg, server_id)
-                q = quota(cur)
-                used_today = q["used_today"]
-                session_ext = q["session_ext"]
+                used_today = today_used(cur)
+                session_ext = int(cur.get("sessionExtensions") or 0)
                 log("-" * 60)
                 log(
-                    f"第 {round_no}/{max_ext} 轮：{fmt_quota(q)} | 到期 {cur.get('sessionExpiresAt')}"
+                    f"第 {round_no}/{max_ext} 轮：今日 {used_today}/4 | 本会话累计 {session_ext}/4 "
+                    f"| 到期 {cur.get('sessionExpiresAt')}"
                 )
-                if q["remaining"] <= 0:
-                    if used_today >= MAX_DAILY_EXTENSIONS:
-                        stop_reason = f"今日已达上限（{used_today}/{MAX_DAILY_EXTENSIONS}）"
-                    elif session_ext >= MAX_SESSION_EXTENSIONS:
-                        stop_reason = f"本会话已达上限（{session_ext}/{MAX_SESSION_EXTENSIONS}）"
-                    else:
-                        stop_reason = "可续期次数为 0"
+                if used_today >= 4:
+                    stop_reason = f"今日已达上限（{used_today}/4）"
                     log(f"到达平台限制：{stop_reason}，停止续期")
-                    log_quota(cur, prefix="当前")
+                    break
+                if session_ext >= 4:
+                    stop_reason = f"本会话已达上限（{session_ext}/4）"
+                    log(f"到达平台限制：{stop_reason}，停止续期")
                     break
 
                 # 点「延伸 / Extend」
@@ -1389,19 +785,64 @@ def run_server(cfg, server_id, account=""):
                     else:
                         log(f"已点击观看广告: {hit2}")
                 log("已打开广告流程，等待 Ad ready…")
-                page.wait_for_timeout(8000)
+                # 等 Ad ready / Watch ad 文案出现（wormies 可能慢加载）
+                ready_deadline = time.time() + 45
+                while time.time() < ready_deadline:
+                    found_ready = False
+                    for fr in page.frames:
+                        for t in ("Ad ready", "Watch ad", "Rewarded ad", "觀看廣告"):
+                            try:
+                                loc = fr.get_by_text(t, exact=False).first
+                                if loc.count() and loc.is_visible():
+                                    log(f"检测到广告界面: {t!r} @ {(fr.url or '')[:60]}")
+                                    found_ready = True
+                                    break
+                            except Exception:
+                                pass
+                        if found_ready:
+                            break
+                    if found_ready:
+                        break
+                    time.sleep(1.2)
+                else:
+                    log("未在限时内看到 Ad ready，仍继续尝试点 Watch ad")
 
                 total = int(cfg["ads_per_extension"])
+                ad_labels = ["Watch ad", "Watch Ad", "觀看廣告", "观看广告"]
                 for i in range(1, total + 1):
+                    # 优先在 wormies / 广告 iframe 点 Watch ad
                     hit = click_anywhere(
-                        page, ["Watch ad", "觀看廣告", "观看广告"], 75000
+                        page, ad_labels, 60000, exact=False, prefer_ad_frames=True
                     )
                     if not hit:
+                        hit = click_anywhere(
+                            page, ad_labels, 30000, exact=False, force=True, prefer_ad_frames=True
+                        )
+                    if not hit:
+                        hit = click_anywhere(page, ad_labels, 20000, exact=False, force=True)
+                    if not hit:
                         log(f"第 {i} 个 Watch ad 未找到，停止")
+                        try:
+                            log(f"当前 frames={len(page.frames)}")
+                            for fr in page.frames[:12]:
+                                log(f"  frame: {(fr.url or '')[:100]}")
+                        except Exception:
+                            pass
                         break
                     log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
                     page.wait_for_timeout(int(cfg["ad_duration_sec"]) * 1000)
-                    closed = click_anywhere(page, ["Close", "關閉", "关闭"], 60000)
+                    # Close 优先广告帧，避免关掉主弹窗
+                    closed = click_anywhere(
+                        page,
+                        ["Close", "關閉", "关闭", "Close ad"],
+                        45000,
+                        exact=False,
+                        prefer_ad_frames=True,
+                    )
+                    if not closed:
+                        closed = click_anywhere(
+                            page, ["Close", "關閉", "关闭"], 15000, exact=False
+                        )
                     log(
                         f"第 {i} 个广告:",
                         f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
@@ -1425,12 +866,10 @@ def run_server(cfg, server_id, account=""):
                         rounds_ok += 1
                         round_ok = True
                         success = True
-                        q_after = quota(now)
                         log(
                             f"第 {round_no} 轮续期成功 -> 新到期: {now.get('sessionExpiresAt')}"
                             f" | 累计: {now.get('sessionExtensions')} | 今日: {today_used(now)}"
                         )
-                        log(f"本轮完成后实时{fmt_quota(q_after)}")
                         break
                     time.sleep(10)
                 if not round_ok:
@@ -1475,45 +914,14 @@ def run_server(cfg, server_id, account=""):
         if uptime is None:
             uptime = seconds_until(before.get("sessionExpiresAt"))
         result = f"✅续期成功（+{rounds_ok * 4}h，共 {rounds_ok} 次）"
-        photo = last_shot if (last_shot is not None and last_shot.exists()) else None
-        if photo is None:
-            cand = pathlib.Path(_shot_name("renew_screenshot.png"))
-            photo = cand if cand.exists() else None
-        remaining_text = fmt_quota(quota(final_state))
-        next_text = fmt_next_renewal(final_state.get("sessionExpiresAt"))
-        log(f"下次续期准确时间: {next_text}")
-        notify_godlike(
-            cfg,
-            account,
-            short_id,
-            result,
-            uptime,
-            final_state.get("status"),
-            photo=photo,
-            remaining_text=remaining_text + "\n📅下次续期: " + next_text,
-        )
+        notify_godlike(cfg, account, short_id, result, uptime, final_state.get("status"))
         return True
     else:
         final_state = now or before
         uptime = seconds_until(final_state.get("sessionExpiresAt"))
         reason = stop_reason or "未检测到续期生效"
-        photo = last_shot if (last_shot is not None and last_shot.exists()) else None
-        if photo is None:
-            for name in ("renew_screenshot.png", "debug_screenshot.png"):
-                cand = pathlib.Path(_shot_name(name))
-                if cand.exists():
-                    photo = cand
-                    break
-        remaining_text = fmt_quota(quota(final_state)) if final_state else ""
         notify_godlike(
-            cfg,
-            account,
-            short_id,
-            f"⚠️续期未生效（{reason}）",
-            uptime,
-            final_state.get("status"),
-            photo=photo,
-            remaining_text=remaining_text,
+            cfg, account, short_id, f"⚠️续期未生效（{reason}）", uptime, final_state.get("status")
         )
         return False
 
@@ -1560,7 +968,7 @@ def main():
         if ok is True:
             mark = "✅ 成功"
         elif ok is None:
-            mark = "⏭️ 跳过（无可用次数 / 尚未到期）"
+            mark = "⏭️ 跳过（今日已满 4 次，UTC 当日）"
         else:
             mark = "❌ 失败"
         if ok is False:
