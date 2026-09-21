@@ -968,65 +968,140 @@ def click_start_button(page) -> str | None:
     return hit
 
 
-def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
-    """点击 Watch ad 并等待播放，返回实际完成的广告数。
+# 面板「解锁内容 / 看短广告」弹窗与激励广告按钮文案
+UNLOCK_AD_LABELS = [
+    "View a short ad",
+    "View a Short Ad",
+    "View short ad",
+    "Watch a short ad",
+    "Unlock more content",
+    "Unlock",
+    "观看短广告",
+    "观看短片",
+    "看广告",
+    "觀看短廣告",
+]
 
-    与续期流程保持一致：进入广告页 → 循环点击 Watch ad → 等待播放 → Close。
-    若第一次点击后广告已在播放，则先等播完再 Close，计入第 1 条。
+WATCH_AD_LABELS = [
+    "View a short ad",
+    "Watch ad",
+    "觀看廣告",
+    "观看广告",
+    "Watch Ad",
+    "Watch ads",
+    "Watch Ads",
+    "Watch",
+    "开始",
+    "開始",
+]
+
+CLOSE_AD_LABELS = [
+    "Close",
+    "關閉",
+    "关闭",
+    "×",
+    "X",
+    "Done",
+    "完成",
+    "Skip",
+    "跳过",
+    "Continue",
+    "继续",
+]
+
+
+def dismiss_unlock_popup(page, reason: str = "面板") -> bool:
+    """处理「Unlock more content / View a short ad」拦截弹窗。
+
+    截图中该弹窗会挡住 Start/续期。点击后进入短广告流程并尽量看完关闭。
+    返回是否点击过解锁广告入口。
     """
-    watch_labels = [
-        "Watch ad",
-        "觀看廣告",
-        "观看广告",
-        "Watch Ad",
-        "Watch ads",
-        "Watch Ads",
-        "Watch",
-        "开始",
-        "開始",
-    ]
-    close_labels = ["Close", "關閉", "关闭", "×", "X", "Done", "完成"]
+    if page is None:
+        return False
+    page.wait_for_timeout(1500)
+    hit = click_anywhere(page, UNLOCK_AD_LABELS, 8000) or click_anywhere(
+        page, UNLOCK_AD_LABELS, 6000, exact=False
+    )
+    if not hit:
+        return False
+    log(f"{reason}: 检测到内容解锁弹窗，已点击: {hit}")
+    # 弹窗广告通常较短，播完后关
+    page.wait_for_timeout(5000)
+    ad_sec = 35
+    page.wait_for_timeout(ad_sec * 1000)
+    closed = click_anywhere(page, CLOSE_AD_LABELS, 40000) or click_anywhere(
+        page, CLOSE_AD_LABELS, 12000, exact=False
+    )
+    log(
+        f"{reason}: 解锁广告:",
+        f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
+    )
+    page.wait_for_timeout(3000)
+    # 若仍残留弹窗，再点一次
+    hit2 = click_anywhere(page, UNLOCK_AD_LABELS, 4000)
+    if hit2:
+        log(f"{reason}: 解锁弹窗仍在，再次点击: {hit2}")
+        page.wait_for_timeout(ad_sec * 1000)
+        click_anywhere(page, CLOSE_AD_LABELS, 30000)
+        page.wait_for_timeout(2000)
+    return True
+
+
+def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
+    """点击广告并等待播放，返回实际完成的广告数。
+
+    兼容：
+    - 旧版 Watch ad
+    - 新版 View a short ad / Unlock more content 弹窗
+    """
     total = int(cfg.get("ads_per_extension") or 3)
     ad_sec = int(cfg.get("ad_duration_sec") or 32)
     watched = 0
 
-    page.wait_for_timeout(3000)
-    # 进入广告流程
-    hit = click_anywhere(page, watch_labels, 30000) or click_anywhere(
-        page, watch_labels, 15000, exact=False
+    # 先清解锁弹窗
+    dismiss_unlock_popup(page, reason=reason)
+
+    page.wait_for_timeout(2000)
+    hit = click_anywhere(page, WATCH_AD_LABELS, 25000) or click_anywhere(
+        page, WATCH_AD_LABELS, 12000, exact=False
     )
     if hit:
         log(f"{reason}: 已进入广告流程（{hit}）")
     else:
-        log(f"{reason}: 未找到入口 Watch ad，尝试直接寻找可点广告按钮")
+        log(f"{reason}: 未找到入口广告按钮，继续尝试逐条查找")
     log(f"{reason}: 等待 Ad ready…")
     page.wait_for_timeout(8000)
 
     for i in range(1, total + 1):
-        # 优先点 Watch ad；若点不到，可能上一条还在播，先尝试 Close 再重试
-        hit = click_anywhere(page, ["Watch ad", "觀看廣告", "观看广告", "Watch Ad"], 75000)
+        # 每条前再清一次弹窗，避免挡住下一则
+        dismiss_unlock_popup(page, reason=f"{reason}/第{i}条前")
+
+        hit = click_anywhere(
+            page,
+            ["View a short ad", "Watch ad", "觀看廣告", "观看广告", "Watch Ad"],
+            60000,
+        )
         if not hit:
-            hit = click_anywhere(page, watch_labels, 20000, exact=False)
+            hit = click_anywhere(page, WATCH_AD_LABELS, 25000, exact=False)
         if not hit:
-            # 广告可能已自动开始播放：等待时长后关
-            log(f"{reason}: 第 {i} 个 Watch ad 未立刻出现，等待播放/关闭按钮…")
+            log(f"{reason}: 第 {i} 个广告按钮未立刻出现，等待播放/关闭…")
             page.wait_for_timeout(ad_sec * 1000)
-            closed = click_anywhere(page, close_labels, 45000) or click_anywhere(
-                page, close_labels, 15000, exact=False
+            closed = click_anywhere(page, CLOSE_AD_LABELS, 45000) or click_anywhere(
+                page, CLOSE_AD_LABELS, 12000, exact=False
             )
             if closed:
                 watched += 1
-                log(f"{reason}: 第 {i}/{total} 个广告：已按播放完成关闭（{closed}）")
+                log(f"{reason}: 第 {i}/{total} 个广告：按播放完成关闭（{closed}）")
                 page.wait_for_timeout(5000)
                 continue
-            log(f"{reason}: 第 {i} 个 Watch ad 未找到，停止广告流程")
+            log(f"{reason}: 第 {i} 个广告未找到，停止广告流程")
             break
 
         watched += 1
-        log(f"{reason}: 已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
+        log(f"{reason}: 已点击第 {i}/{total} 个广告（{hit}），播放中…")
         page.wait_for_timeout(ad_sec * 1000)
-        closed = click_anywhere(page, close_labels, 60000) or click_anywhere(
-            page, close_labels, 15000, exact=False
+        closed = click_anywhere(page, CLOSE_AD_LABELS, 60000) or click_anywhere(
+            page, CLOSE_AD_LABELS, 15000, exact=False
         )
         log(
             f"{reason}: 第 {i} 个广告:",
@@ -1039,37 +1114,62 @@ def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
 
 
 def restart_via_panel(cfg, page, reason: str = "关机后重启", server_id: str | None = None) -> int:
-    """在面板点击 Start/开机并看激励广告。
+    """在面板处理解锁弹窗 → Start → 激励广告 → 再 Start / API start。
 
-    返回完成的广告数。若传入 server_id，广告结束后会带 adsCompleted 再调一次 start API。
+    返回完成的广告数。
     """
     if page is None:
         return 0
+
+    # 1) 先点掉 Unlock / View a short ad 拦截层
+    dismiss_unlock_popup(page, reason=reason)
+    page.wait_for_timeout(1500)
+
+    # 2) 点 Start
     hit = click_start_button(page)
     if not hit:
+        # Start 可能被弹窗挡住，再清一次后重试
+        dismiss_unlock_popup(page, reason=reason)
+        hit = click_start_button(page)
+    if not hit:
         log(f"{reason}: 面板上未找到 Start/开机 按钮")
-        return 0
-    log(f"{reason}: 已点击开机入口: {hit}")
+        # 仍尝试只看广告（有时看完广告后才会允许开机）
+    else:
+        log(f"{reason}: 已点击开机入口: {hit}")
     page.wait_for_timeout(2500)
+
+    # 3) 看激励广告（含 View a short ad）
     watched = watch_rewarded_ads(cfg, page, reason=reason)
 
-    # 广告看完后，用 adsCompleted 再请求一次开机（平台要求）
+    # 4) 广告后再清弹窗并点一次 Start（平台常在广告后才真正启动）
+    dismiss_unlock_popup(page, reason=f"{reason}/广告后")
+    hit2 = click_start_button(page)
+    if hit2:
+        log(f"{reason}: 广告后再次点击 Start: {hit2}")
+        page.wait_for_timeout(3000)
+
+    # 5) 带 adsCompleted 调 API start
     if server_id:
         n = max(watched, int(cfg.get("ads_per_extension") or 3))
-        for ads_n in (n, 3, 2, 1):
-            log(f"{reason}: 广告后再次 API start（adsCompleted={ads_n}）")
+        accepted = False
+        for ads_n in (n, 3, 2, 1, 0):
+            log(f"{reason}: 广告后 API start（adsCompleted={ads_n}）")
             code, data = api_power(cfg, server_id, "start", {"adsCompleted": ads_n})
             if code in (200, 201, 202, 204):
                 log(f"{reason}: API start 已接受（adsCompleted={ads_n}）")
+                accepted = True
                 break
             if not ads_required_error(code, data):
-                # 非广告错误，再试 restart
                 code2, _ = api_power(cfg, server_id, "restart")
                 if code2 in (200, 201, 202, 204):
                     log(f"{reason}: API restart 已接受")
+                    accepted = True
                     break
             page.wait_for_timeout(1500)
+        if not accepted:
+            log(f"{reason}: API 仍未接受 start，依赖面板 Start 状态变化")
     return watched
+
 
 
 def ads_required_error(code, data) -> bool:
@@ -1581,6 +1681,7 @@ def run_server(cfg, server_id, account=""):
     stop_reason = ""
 
     watch_labels = [
+        "View a short ad",
         "觀看廣告",
         "观看广告",
         "Watch ad",
@@ -1639,6 +1740,12 @@ def run_server(cfg, server_id, account=""):
             except Exception:
                 pass
             page.wait_for_timeout(5000)
+
+            # 先处理「Unlock more content / View a short ad」拦截弹窗
+            try:
+                dismiss_unlock_popup(page, reason="打开面板")
+            except Exception as e:
+                log(f"处理解锁弹窗时忽略异常: {e}")
 
             before = api_state(cfg, server_id)
             log(
@@ -1768,6 +1875,26 @@ def run_server(cfg, server_id, account=""):
                         entered_direct = True
                 if not hit:
                     log("未找到续期入口按钮")
+                    # 仍关机时优先视为开机未完成，而不是续期按钮逻辑错误
+                    try:
+                        st_now = api_state(cfg, server_id)
+                    except Exception:
+                        st_now = {}
+                    if is_stopped(st_now) or not is_running(st_now):
+                        log("服务器仍未运行，续期入口不可用（开机未完成）")
+                        dump_page_debug(page, "开机未完成无续期入口")
+                        notify(
+                            cfg,
+                            "⚠️ Voer 开机未完成",
+                            [
+                                f"服务器: <code>{short_id}</code>",
+                                f"状态: {st_now.get('status') or 'unknown'}",
+                                "原因: 关机后未能成功开机，面板无续期入口",
+                                "请查看日志中的广告/Start 步骤",
+                            ],
+                            photo=pathlib.Path(_shot_name("debug_screenshot.png")),
+                        )
+                        return False
                     if round_no == 1:
                         dump_page_debug(page, "找不到延伸按钮")
                         notify(
