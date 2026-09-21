@@ -997,6 +997,7 @@ WATCH_AD_LABELS = [
 
 CLOSE_AD_LABELS = [
     "Close",
+    "close",
     "關閉",
     "关闭",
     "×",
@@ -1047,67 +1048,117 @@ def dismiss_unlock_popup(page, reason: str = "面板") -> bool:
     return True
 
 
+def _page_has_ad_ready(page) -> bool:
+    """页面是否出现 Ad ready / 广告播放中（无需再点 Watch ad）。"""
+    try:
+        txt = page.content() or ""
+    except Exception:
+        try:
+            txt = page.inner_text("body") or ""
+        except Exception:
+            return False
+    low = txt.lower()
+    return (
+        "ad ready" in low
+        or "watch 3 ads" in low
+        or "progress" in low and "/ 3" in low
+        or "1 / 3" in low
+        or "2 / 3" in low
+    )
+
+
 def watch_rewarded_ads(cfg, page, reason: str = "开机/续期") -> int:
     """点击广告并等待播放，返回实际完成的广告数。
 
     兼容：
     - 旧版 Watch ad
-    - 新版 View a short ad / Unlock more content 弹窗
+    - 新版 View a short ad / Unlock more content
+    - 已显示 Ad ready（广告已在播）时先等播完再 Close，再找下一则
     """
     total = int(cfg.get("ads_per_extension") or 3)
     ad_sec = int(cfg.get("ad_duration_sec") or 32)
     watched = 0
 
-    # 先清解锁弹窗
     dismiss_unlock_popup(page, reason=reason)
-
     page.wait_for_timeout(2000)
-    hit = click_anywhere(page, WATCH_AD_LABELS, 25000) or click_anywhere(
-        page, WATCH_AD_LABELS, 12000, exact=False
-    )
-    if hit:
-        log(f"{reason}: 已进入广告流程（{hit}）")
+
+    # 若尚未进入广告层，点一次入口
+    if not _page_has_ad_ready(page):
+        hit = click_anywhere(page, WATCH_AD_LABELS, 25000) or click_anywhere(
+            page, WATCH_AD_LABELS, 12000, exact=False
+        )
+        if hit:
+            log(f"{reason}: 已进入广告流程（{hit}）")
+        else:
+            log(f"{reason}: 未找到入口广告按钮，继续尝试逐条查找")
     else:
-        log(f"{reason}: 未找到入口广告按钮，继续尝试逐条查找")
+        log(f"{reason}: 检测到广告已在进行（Ad ready / Progress）")
     log(f"{reason}: 等待 Ad ready…")
-    page.wait_for_timeout(8000)
+    page.wait_for_timeout(6000)
 
     for i in range(1, total + 1):
-        # 每条前再清一次弹窗，避免挡住下一则
         dismiss_unlock_popup(page, reason=f"{reason}/第{i}条前")
 
-        hit = click_anywhere(
-            page,
-            ["View a short ad", "Watch ad", "觀看廣告", "观看广告", "Watch Ad"],
-            60000,
-        )
-        if not hit:
-            hit = click_anywhere(page, WATCH_AD_LABELS, 25000, exact=False)
-        if not hit:
-            log(f"{reason}: 第 {i} 个广告按钮未立刻出现，等待播放/关闭…")
-            page.wait_for_timeout(ad_sec * 1000)
-            closed = click_anywhere(page, CLOSE_AD_LABELS, 45000) or click_anywhere(
-                page, CLOSE_AD_LABELS, 12000, exact=False
+        already = _page_has_ad_ready(page)
+        hit = None
+        if not already:
+            hit = click_anywhere(
+                page,
+                ["View a short ad", "Watch ad", "觀看廣告", "观看广告", "Watch Ad"],
+                45000,
             )
-            if closed:
-                watched += 1
-                log(f"{reason}: 第 {i}/{total} 个广告：按播放完成关闭（{closed}）")
-                page.wait_for_timeout(5000)
-                continue
-            log(f"{reason}: 第 {i} 个广告未找到，停止广告流程")
-            break
+            if not hit:
+                hit = click_anywhere(page, WATCH_AD_LABELS, 20000, exact=False)
 
-        watched += 1
-        log(f"{reason}: 已点击第 {i}/{total} 个广告（{hit}），播放中…")
-        page.wait_for_timeout(ad_sec * 1000)
+        if hit:
+            watched += 1
+            log(f"{reason}: 已点击第 {i}/{total} 个广告（{hit}），播放中…")
+            page.wait_for_timeout(ad_sec * 1000)
+        elif already:
+            watched += 1
+            log(f"{reason}: 第 {i}/{total} 个广告已在播放（Ad ready），等待结束…")
+            page.wait_for_timeout(ad_sec * 1000)
+        else:
+            # 最后手段：干等一轮看 Close 是否出现
+            log(f"{reason}: 第 {i} 个广告按钮未出现，等待 Close…")
+            page.wait_for_timeout(ad_sec * 1000)
+
         closed = click_anywhere(page, CLOSE_AD_LABELS, 60000) or click_anywhere(
             page, CLOSE_AD_LABELS, 15000, exact=False
         )
+        # 截图里右上角 close 可能在 iframe
+        if not closed:
+            try:
+                for frame in page.frames:
+                    for sel in (
+                        "text=close",
+                        "text=Close",
+                        "[aria-label='Close']",
+                        "button:has-text('Close')",
+                    ):
+                        try:
+                            loc = frame.locator(sel).first
+                            if loc.count() and loc.is_visible():
+                                loc.click(timeout=3000)
+                                closed = f"{sel}@{frame.url[:40]}"
+                                break
+                        except Exception:
+                            pass
+                    if closed:
+                        break
+            except Exception:
+                pass
         log(
             f"{reason}: 第 {i} 个广告:",
             f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
         )
-        page.wait_for_timeout(6000)
+        if not hit and not already and not closed:
+            log(f"{reason}: 第 {i} 个广告无进展，停止广告流程")
+            # 回退 watched 多计
+            if watched and not closed:
+                watched = max(0, watched - 1)
+            break
+        page.wait_for_timeout(5000)
 
     log(f"{reason}: 广告流程结束，完成 {watched}/{total} 条")
     return watched
@@ -1852,36 +1903,36 @@ def run_server(cfg, server_id, account=""):
                     log_quota(cur, prefix="当前")
                     break
 
-                # 点「延伸 / Extend」
+                # 点「延伸 / Extend」；新版可能直接是广告弹窗（Watch 3 ads…）
+                try:
+                    dismiss_unlock_popup(page, reason=f"续期第{round_no}轮")
+                except Exception:
+                    pass
                 log("正在寻找「续期/延伸」按钮…")
-                hit = click_anywhere(page, extend_labels, 45000)
+                hit = click_anywhere(page, extend_labels, 25000)
                 if not hit:
-                    page.wait_for_timeout(5000)
-                    # 弹窗（Cookie/公告）可能中途弹出挡住按钮，再点一次
+                    page.wait_for_timeout(3000)
                     for accept_txt in ("Accept", "Accept all", "同意", "接受", "OK"):
                         if click_anywhere(page, [accept_txt], 2000):
                             log(f"再次点掉弹窗: {accept_txt}")
-                    hit = click_anywhere(page, extend_labels, 30000, exact=False)
-                entered_direct = False
+                    hit = click_anywhere(page, extend_labels, 20000, exact=False)
                 if not hit:
-                    # 部分版本面板没有「延伸」入口，续期入口就是 Watch ad 按钮本身
-                    log("未找到「延伸」入口，尝试直接点击 Watch ad…")
-                    hit2 = click_anywhere(page, watch_labels, 30000) or click_anywhere(
-                        page, watch_labels, 15000, exact=False
-                    )
-                    if hit2:
-                        log(f"已直接点击 Watch ad 作为续期入口: {hit2}")
-                        hit = "Watch ad(直入)"
-                        entered_direct = True
-                if not hit:
-                    log("未找到续期入口按钮")
-                    # 仍关机时优先视为开机未完成，而不是续期按钮逻辑错误
+                    # 无延伸按钮时：续期入口可能就是 Watch ad / View a short ad
+                    log("未找到「延伸」入口，将直接走广告续期流程…")
+                else:
+                    log(f"已点击续期入口: {hit}")
+                    page.wait_for_timeout(2000)
+
+                # 与开机相同的广告流程（兼容 Ad ready 已在播放、View a short ad、Close）
+                watched = watch_rewarded_ads(cfg, page, reason=f"续期第{round_no}轮")
+                if watched <= 0:
+                    log("本轮未完成任何广告")
+                    # 服务器仍停机时区分错误
                     try:
                         st_now = api_state(cfg, server_id)
                     except Exception:
                         st_now = {}
                     if is_stopped(st_now) or not is_running(st_now):
-                        log("服务器仍未运行，续期入口不可用（开机未完成）")
                         dump_page_debug(page, "开机未完成无续期入口")
                         notify(
                             cfg,
@@ -1889,57 +1940,27 @@ def run_server(cfg, server_id, account=""):
                             [
                                 f"服务器: <code>{short_id}</code>",
                                 f"状态: {st_now.get('status') or 'unknown'}",
-                                "原因: 关机后未能成功开机，面板无续期入口",
-                                "请查看日志中的广告/Start 步骤",
+                                "原因: 关机后未能成功开机，无法续期",
                             ],
                             photo=pathlib.Path(_shot_name("debug_screenshot.png")),
                         )
                         return False
                     if round_no == 1:
-                        dump_page_debug(page, "找不到延伸按钮")
+                        dump_page_debug(page, "续期广告未完成")
                         notify(
                             cfg,
                             "❌ Voer 续期失败",
                             [
                                 f"服务器: <code>{short_id}</code>",
-                                "原因: 未找到「延伸/续期」按钮",
+                                "原因: 续期广告未完成（未找到 Watch ad / Close）",
                                 "请查看 Actions 日志或 debug 截图",
                             ],
                             photo=pathlib.Path(_shot_name("debug_screenshot.png")),
                         )
                         return False
-                    stop_reason = "找不到「延伸/续期」按钮"
+                    stop_reason = "续期广告未完成"
                     break
-                log(f"已点击续期入口: {hit}")
-                page.wait_for_timeout(3000)
-
-                if not entered_direct:
-                    hit2 = click_anywhere(page, watch_labels, 30000)
-                    if not hit2:
-                        hit2 = click_anywhere(page, watch_labels, 20000, exact=False)
-                    if not hit2:
-                        log("未找到「观看广告」按钮（可能已直接进入广告流程）")
-                    else:
-                        log(f"已点击观看广告: {hit2}")
-                log("已打开广告流程，等待 Ad ready…")
-                page.wait_for_timeout(8000)
-
-                total = int(cfg["ads_per_extension"])
-                for i in range(1, total + 1):
-                    hit = click_anywhere(
-                        page, ["Watch ad", "觀看廣告", "观看广告"], 75000
-                    )
-                    if not hit:
-                        log(f"第 {i} 个 Watch ad 未找到，停止")
-                        break
-                    log(f"已点击第 {i}/{total} 个 Watch ad（{hit}），播放中…")
-                    page.wait_for_timeout(int(cfg["ad_duration_sec"]) * 1000)
-                    closed = click_anywhere(page, ["Close", "關閉", "关闭"], 60000)
-                    log(
-                        f"第 {i} 个广告:",
-                        f"已关闭（{closed}）" if closed else "未找到 Close（可能自动关闭）",
-                    )
-                    page.wait_for_timeout(6000)
+                log(f"本轮广告完成 {watched} 条，等待续期生效…")
 
                 # 等待本轮 +4h 生效
                 end = time.time() + 180
