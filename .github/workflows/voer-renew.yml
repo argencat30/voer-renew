@@ -170,10 +170,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # 可选：覆盖默认值
-          # VOER_ADS_PER_EXTENSION: "3"
+          VOER_ADS_PER_EXTENSION: "4"
           # VOER_AD_DURATION_SEC: "35"
           # VOER_EXTENSIONS_PER_RUN: "4"   # 单次运行内连续续期几次（默认 4 = 续满当日上限）
-          # TG_TITLE: "Godlike 续期通知"    # 自定义 TG 通知标题
+          TG_TITLE: "voer-30 续期通知"    # 自定义 TG 通知标题
         run: |
           echo "开始续期，预计 3～5 分钟..."
           xvfb-run -a python3 voer_renew.py
